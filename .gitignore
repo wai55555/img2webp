@@ -1,0 +1,38 @@
+# Local input, output, and processing state
+/inputs/
+/outputs/
+/png2webp/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# Local utility (kept on disk, not published)
+/flip_vertical.bat
+/flip_vertical.py
+
+# Python environments and generated files
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+/build/
+/dist/
+
+# Personal configuration and editor files
+/.agents/
+/.aws/
+/.codex/
+/.idea/
+/.vscode/
+.env
+.env.*
+*.log
+*.lnk
+Thumbs.db
+desktop.ini
+.DS_Store
