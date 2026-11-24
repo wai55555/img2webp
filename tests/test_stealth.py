@@ -21,9 +21,10 @@ def chunk(kind: bytes, data: bytes) -> bytes:
 
 
 def make_png(path: Path, depth: int, color: int, mode: str, payload: bytes,
-             compression: str = "info", filter_type: int = 0, length: int | None = None) -> None:
+             compression: str = "info", filter_type: int = 0, length: int | None = None,
+             size: tuple[int, int] = (40, 30)) -> None:
     channels = {2: 3, 4: 2, 6: 4}[color]
-    width, height = 40, 30
+    width, height = size
     sample_bytes = depth // 8
     bpp = channels * sample_bytes
     rows = [bytearray([128] * (width * bpp)) for _ in range(height)]
@@ -157,6 +158,31 @@ class StealthTests(unittest.TestCase):
         contents = path.read_bytes()
         path.write_bytes(contents[:-8])
         self.assertIsNone(app.png_16bit_pixels(path))
+        with Image.open(path) as image:
+            self.assertEqual(app.stealth_text(image, path), "")
+
+    def test_large_payload_and_header_only_scan(self) -> None:
+        for depth, color, mode in ((8, 2, "rgb"), (8, 6, "alpha"),
+                                   (16, 2, "rgb"), (16, 6, "alpha")):
+            path = self.inputs / f"{depth}-{color}-{mode}.png"
+            payload = b"payload" * 3000
+            make_png(path, depth, color, mode, payload, filter_type=4, size=(512, 512))
+            with self.subTest(depth=depth, mode=mode), Image.open(path) as image:
+                self.assertEqual(app.stealth_text(image, path), payload.decode())
+        path = self.inputs / "plain.png"
+        make_png(path, 16, 6, "alpha", b"data", filter_type=4, size=(200, 200))
+        # Remove both possible signatures without changing the PNG structure.
+        with patch.object(app, "png_16bit_pixels", wraps=app.png_16bit_pixels) as decoder:
+            original = app.png_16bit_pixels(path, header_only=True)
+            self.assertIsNotNone(original)
+            decoded, width, height, channels = original
+            decoded[2] |= 1
+            decoded[8] |= 1
+            decoder.return_value = (decoded, width, height, channels)
+            decoder.reset_mock()
+            with Image.open(path) as image:
+                self.assertEqual(app.stealth_text(image, path), "")
+            decoder.assert_called_once_with(path, header_only=True)
 
 
 if __name__ == "__main__":

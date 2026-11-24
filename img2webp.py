@@ -324,7 +324,7 @@ MAX_STEALTH_BYTES = 8 * 1024 * 1024
 MAX_PNG_BYTES = 512 * 1024 * 1024
 
 
-def png_16bit_pixels(path: Path) -> tuple[bytearray, int, int, int] | None:
+def png_16bit_pixels(path: Path, header_only: bool = False) -> tuple[bytearray, int, int, int] | None:
     """Decode non-interlaced 16-bit PNG scanlines without discarding low bits."""
     with path.open("rb") as stream:
         header = stream.read(33)
@@ -382,14 +382,18 @@ def png_16bit_pixels(path: Path) -> tuple[bytearray, int, int, int] | None:
             return None
 
     bpp = channels * 2
-    for y in range(height):
+    # Only the first 152 column-major bits are needed to identify a header.
+    # Filter dependencies require all preceding rows and columns in that area.
+    rows = min(height, 152) if header_only else height
+    columns = min(width, (152 + height - 1) // height) if header_only else width
+    for y in range(rows):
         row = y * (stride + 1)
         method = decoded[row]
         if method > 4:
             return None
         if method == 0:
             continue
-        for x in range(stride):
+        for x in range(columns * bpp):
             i = row + 1 + x
             left = decoded[i - bpp] if x >= bpp else 0
             above = decoded[i - stride - 1] if y else 0
@@ -416,8 +420,10 @@ def stealth_text(image: Image.Image, path: Path) -> str:
         header = stream.read(29)
     if len(header) < 29:
         return ""
-    if header[24] == 16:
-        raw = png_16bit_pixels(path)
+    depth_16 = header[24] == 16
+    header_only_16 = depth_16
+    if depth_16:
+        raw = png_16bit_pixels(path, header_only=True)
         if raw is None:
             return ""
         decoded, width, height, channel_count = raw
@@ -462,7 +468,32 @@ def stealth_text(image: Image.Image, path: Path) -> str:
         length = int.from_bytes(header[15:], "big")
         if length % 8 or length > MAX_STEALTH_BYTES * 8 or 152 + length > capacity:
             continue
-        payload = read_bytes(19, length // 8)
+        if header_only_16:
+            raw = png_16bit_pixels(path)
+            if raw is None:
+                return ""
+            decoded = raw[0]
+            header_only_16 = False
+        if length == 0:
+            payload = b""
+        else:
+            # Pillow performs transpose, channel selection and bit packing in C.
+            end_bit = 152 + length
+            columns = min(width, (end_bit + height * len(channels) - 1) // (height * len(channels)))
+            if depth_16:
+                low_bytes = bytearray()
+                for y in range(height):
+                    start = y * stride + 2
+                    low_bytes.extend(decoded[start:start + columns * channel_count * 2:2])
+                mode = {2: "LA", 3: "RGB", 4: "RGBA"}[channel_count]
+                source_pixels = Image.frombytes(mode, (columns, height), bytes(low_bytes))
+            else:
+                source_pixels = image.crop((0, 0, columns, height))
+            transposed = source_pixels.transpose(Image.Transpose.TRANSPOSE)
+            plane = transposed.getchannel("A") if prefix == b"stealth_png" else transposed.convert("RGB")
+            bits = plane.tobytes()[152:end_bit]
+            bit_image = Image.frombytes("L", (len(bits), 1), bits)
+            payload = bit_image.point([255 if i & 1 else 0 for i in range(256)], mode="1").tobytes()
         try:
             if header[11:15] == b"comp":
                 decoder = zlib.decompressobj(47)
