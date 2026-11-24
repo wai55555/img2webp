@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import zlib
 from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ from PIL import Image, ImageCms, features
 
 PROJECT_DIR = Path(__file__).resolve().parent
 STATE_DATABASE_NAME = ".img2webp.sqlite3"
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
 CONVERT_FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".gif": "GIF"}
 ORIENTATION_OPERATIONS = {
     2: Image.Transpose.FLIP_LEFT_RIGHT,
@@ -319,6 +320,192 @@ def text_value(value: object) -> str:
     return ""
 
 
+MAX_STEALTH_BYTES = 8 * 1024 * 1024
+MAX_PNG_BYTES = 512 * 1024 * 1024
+
+
+def png_16bit_pixels(path: Path, header_only: bool = False) -> tuple[bytearray, int, int, int] | None:
+    """Decode non-interlaced 16-bit PNG scanlines without discarding low bits."""
+    with path.open("rb") as stream:
+        header = stream.read(33)
+        if (len(header) != 33 or header[:8] != b"\x89PNG\r\n\x1a\n"
+                or header[8:16] != b"\x00\x00\x00\x0dIHDR"):
+            return None
+        width = int.from_bytes(header[16:20], "big")
+        height = int.from_bytes(header[20:24], "big")
+        depth, color, compression, filtering, interlace = header[24:29]
+        channels = {2: 3, 4: 2, 6: 4}.get(color)
+        if (depth != 16 or channels is None or compression or filtering or interlace
+                or not 0 < width <= 16384 or not 0 < height <= 16384):
+            return None
+        stride = width * channels * 2
+        expected = (stride + 1) * height
+        if expected > MAX_PNG_BYTES:
+            return None
+        decoder = zlib.decompressobj()
+        decoded = bytearray()
+        idat_size = 0
+        saw_idat = False
+        ended_idat = False
+        try:
+            while True:
+                chunk_header = stream.read(8)
+                if len(chunk_header) != 8:
+                    return None
+                length = int.from_bytes(chunk_header[:4], "big")
+                kind = chunk_header[4:]
+                if kind == b"IDAT":
+                    if ended_idat or idat_size + length > MAX_PNG_BYTES:
+                        return None
+                    saw_idat = True
+                    idat_size += length
+                    remaining = length
+                    while remaining:
+                        block = stream.read(min(remaining, 65536))
+                        if not block:
+                            return None
+                        remaining -= len(block)
+                        decoded.extend(decoder.decompress(block, expected + 1 - len(decoded)))
+                        if len(decoded) > expected or decoder.unconsumed_tail:
+                            return None
+                else:
+                    if saw_idat:
+                        ended_idat = True
+                    stream.seek(length, os.SEEK_CUR)
+                if len(stream.read(4)) != 4:
+                    return None
+                if kind == b"IEND":
+                    break
+        except zlib.error:
+            return None
+        if not saw_idat or not decoder.eof or len(decoded) != expected:
+            return None
+
+    bpp = channels * 2
+    # Only the first 152 column-major bits are needed to identify a header.
+    # Filter dependencies require all preceding rows and columns in that area.
+    rows = min(height, 152) if header_only else height
+    columns = min(width, (152 + height - 1) // height) if header_only else width
+    for y in range(rows):
+        row = y * (stride + 1)
+        method = decoded[row]
+        if method > 4:
+            return None
+        if method == 0:
+            continue
+        for x in range(columns * bpp):
+            i = row + 1 + x
+            left = decoded[i - bpp] if x >= bpp else 0
+            above = decoded[i - stride - 1] if y else 0
+            upper_left = decoded[i - stride - 1 - bpp] if y and x >= bpp else 0
+            if method == 1:
+                predictor = left
+            elif method == 2:
+                predictor = above
+            elif method == 3:
+                predictor = (left + above) // 2
+            else:
+                p = left + above - upper_left
+                distances = (abs(p - left), abs(p - above), abs(p - upper_left))
+                predictor = (left, above, upper_left)[distances.index(min(distances))]
+            decoded[i] = (decoded[i] + predictor) & 255
+    return decoded, width, height, channels
+
+
+def stealth_text(image: Image.Image, path: Path) -> str:
+    """Read column-major Stealth PNG Info before lossy conversion."""
+    if image.format != "PNG":
+        return ""
+    with path.open("rb") as stream:
+        header = stream.read(29)
+    if len(header) < 29:
+        return ""
+    depth_16 = header[24] == 16
+    header_only_16 = depth_16
+    if depth_16:
+        raw = png_16bit_pixels(path, header_only=True)
+        if raw is None:
+            return ""
+        decoded, width, height, channel_count = raw
+        stride = width * channel_count * 2 + 1
+        def sample(x: int, y: int, channel: int) -> int:
+            return decoded[y * stride + 1 + x * channel_count * 2 + channel * 2 + 1]
+        modes = (([channel_count - 1], b"stealth_png"),) if channel_count == 2 else (
+            (([3], b"stealth_png"), ([0, 1, 2], b"stealth_rgb")) if channel_count == 4
+            else (([0, 1, 2], b"stealth_rgb"),)
+        )
+    else:
+        if image.mode not in {"RGB", "RGBA", "LA"}:
+            return ""
+        width, height = image.size
+        if width > 16384 or height > 16384 or width * height * len(image.getbands()) > MAX_PNG_BYTES:
+            return ""
+        pixels = image.load()
+        def sample(x: int, y: int, channel: int) -> int:
+            return pixels[x, y][channel]
+        modes = []
+        if image.mode in {"RGBA", "LA"}:
+            modes.append(([-1], b"stealth_png"))
+        if image.mode in {"RGB", "RGBA"}:
+            modes.append(([0, 1, 2], b"stealth_rgb"))
+    for channels, prefix in modes:
+        capacity = width * height * len(channels)
+        def read_bytes(start: int, count: int) -> bytes:
+            result = bytearray()
+            for byte_index in range(start, start + count):
+                value = 0
+                for bit in range(8):
+                    index = byte_index * 8 + bit
+                    pixel, channel = divmod(index, len(channels))
+                    value = (value << 1) | (sample(pixel // height, pixel % height, channels[channel]) & 1)
+                result.append(value)
+            return bytes(result)
+        if capacity < 152:
+            continue
+        header = read_bytes(0, 19)
+        if header[:15] not in (prefix + b"info", prefix + b"comp"):
+            continue
+        length = int.from_bytes(header[15:], "big")
+        if length % 8 or length > MAX_STEALTH_BYTES * 8 or 152 + length > capacity:
+            continue
+        if header_only_16:
+            raw = png_16bit_pixels(path)
+            if raw is None:
+                return ""
+            decoded = raw[0]
+            header_only_16 = False
+        if length == 0:
+            payload = b""
+        else:
+            # Pillow performs transpose, channel selection and bit packing in C.
+            end_bit = 152 + length
+            columns = min(width, (end_bit + height * len(channels) - 1) // (height * len(channels)))
+            if depth_16:
+                low_bytes = bytearray()
+                for y in range(height):
+                    start = y * stride + 2
+                    low_bytes.extend(decoded[start:start + columns * channel_count * 2:2])
+                mode = {2: "LA", 3: "RGB", 4: "RGBA"}[channel_count]
+                source_pixels = Image.frombytes(mode, (columns, height), bytes(low_bytes))
+            else:
+                source_pixels = image.crop((0, 0, columns, height))
+            transposed = source_pixels.transpose(Image.Transpose.TRANSPOSE)
+            plane = transposed.getchannel("A") if prefix == b"stealth_png" else transposed.convert("RGB")
+            bits = plane.tobytes()[152:end_bit]
+            bit_image = Image.frombytes("L", (len(bits), 1), bits)
+            payload = bit_image.point([255 if i & 1 else 0 for i in range(256)], mode="1").tobytes()
+        try:
+            if header[11:15] == b"comp":
+                decoder = zlib.decompressobj(47)
+                payload = decoder.decompress(payload, MAX_STEALTH_BYTES + 1)
+                if len(payload) > MAX_STEALTH_BYTES or not decoder.eof:
+                    continue
+            return payload.decode("utf-8")
+        except (UnicodeDecodeError, zlib.error):
+            continue
+    return ""
+
+
 def source_text(image: Image.Image, initial_info: dict[str, object]) -> str:
     if image.format == "PNG":
         lines: list[str] = []
@@ -345,7 +532,7 @@ def has_exif_data(exif_dict: dict[str, object]) -> bool:
 
 
 def prepare_metadata(
-    image: Image.Image, initial_info: dict[str, object], preserve: bool
+    image: Image.Image, initial_info: dict[str, object], preserve: bool, source: Path
 ) -> tuple[dict[str, object] | None, bytes | None, bytes | None, int | None]:
     raw_exif = initial_info.get("exif")
     if raw_exif and not isinstance(raw_exif, bytes):
@@ -367,6 +554,9 @@ def prepare_metadata(
         return None, None, None, orientation
 
     candidate = source_text(image, initial_info)
+    hidden = stealth_text(image, source)
+    if hidden:
+        candidate = "\n".join(filter(None, (candidate, hidden)))
     existing_comment = exif_dict["Exif"].get(piexif.ExifIFD.UserComment)
     if candidate:
         if existing_comment:
@@ -462,7 +652,7 @@ def convert_image(source: Path, destination: Path, config: Config) -> list[str]:
         if image.format != expected_format:
             raise ConversionError(f"拡張子は {expected_format} ですが、実際の形式は {image.format} です")
         initial_info = image.info.copy()
-        exif_dict, icc, xmp, orientation = prepare_metadata(image, initial_info, config.preserve_metadata)
+        exif_dict, icc, xmp, orientation = prepare_metadata(image, initial_info, config.preserve_metadata, source)
         color_icc = initial_info.get("icc_profile")
         if color_icc is not None and not isinstance(color_icc, bytes):
             raise ConversionError("ICC プロファイルの形式を読めません")
