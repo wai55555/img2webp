@@ -13,6 +13,9 @@ use crate::paths;
 
 pub const DEFAULT_METHOD_STILL: i64 = 4;
 pub const DEFAULT_METHOD_ANIMATION: i64 = 0;
+/// Default pixel limit above which the 16-bit Stealth scan is skipped
+/// (16,777,216 px = 4096x4096). `0` means no limit.
+pub const DEFAULT_STEALTH_MAX_PIXELS: i64 = 16_777_216;
 
 #[derive(Debug)]
 pub struct ConfigError(pub String);
@@ -46,6 +49,9 @@ pub struct Config {
     pub method: Option<i64>,
     pub exact: bool,
     pub parallel_jobs: Option<i64>,
+    // Stealth scanning policy (optional keys, see §4.2).
+    pub stealth: bool,
+    pub stealth_max_pixels: i64,
 }
 
 impl Config {
@@ -80,6 +86,7 @@ const REQUIRED_KEYS: &[(&str, &[&str])] = &[
 const OPTIONAL_KEYS: &[(&str, &[&str])] = &[
     ("webp", &["lossless", "method", "exact"]),
     ("output", &["parallel_jobs"]),
+    ("preserve", &["stealth", "stealth_max_pixels"]),
 ];
 
 #[derive(Debug, Default)]
@@ -440,6 +447,29 @@ pub fn load(path: &Path, project_dir: &Path) -> Result<Config, ConfigError> {
     let lossless = get_bool_optional("webp", "lossless")?;
     let exact = get_bool_optional("webp", "exact")?;
 
+    // Stealth scanning is on by default; the pixel limit only guards the
+    // expensive 16-bit path (0 disables the limit).
+    let stealth = match ini.value("preserve", "stealth") {
+        None => true,
+        Some(raw) => parse_bool(raw).ok_or_else(|| {
+            ConfigError("[preserve] stealth は true または false にしてください".to_string())
+        })?,
+    };
+    let stealth_max_pixels = match ini.value("preserve", "stealth_max_pixels") {
+        None => DEFAULT_STEALTH_MAX_PIXELS,
+        Some(raw) => {
+            let value = parse_int(raw).ok_or_else(|| {
+                ConfigError("[preserve] stealth_max_pixels は整数にしてください".to_string())
+            })?;
+            if !(0..=i64::MAX as i128).contains(&value) {
+                return Err(ConfigError(
+                    "[preserve] stealth_max_pixels は 0 以上にしてください（0 は無制限）".to_string(),
+                ));
+            }
+            value as i64
+        }
+    };
+
     Ok(Config {
         input_dir,
         output_dir,
@@ -459,6 +489,8 @@ pub fn load(path: &Path, project_dir: &Path) -> Result<Config, ConfigError> {
         method,
         exact,
         parallel_jobs,
+        stealth,
+        stealth_max_pixels,
     })
 }
 
@@ -580,12 +612,48 @@ mod tests {
                 "db_commit_every = 32\nparallel_jobs = -1",
                 "正の整数",
             ),
+            (
+                "metadata = true",
+                "metadata = true\nstealth = perhaps",
+                "[preserve] stealth は true または false",
+            ),
+            (
+                "metadata = true",
+                "metadata = true\nstealth_max_pixels = -1",
+                "[preserve] stealth_max_pixels は 0 以上",
+            ),
+            (
+                "metadata = true",
+                "metadata = true\nstealth_max_pixels = 1_0",
+                "[preserve] stealth_max_pixels は整数",
+            ),
         ] {
             let body = BASE.replace(from, to);
             let path = write_config(&dir, &body);
             let error = load(&path, &dir).unwrap_err();
             assert!(error.0.contains(expected), "{} => {}", to, error.0);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stealth_keys_default_and_accept_zero_as_unlimited() {
+        let dir = std::env::temp_dir().join(format!("img2webp-config9-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Absent keys: scanning on, default limit.
+        let path = write_config(&dir, BASE);
+        let config = load(&path, &dir).unwrap();
+        assert!(config.stealth);
+        assert_eq!(config.stealth_max_pixels, DEFAULT_STEALTH_MAX_PIXELS);
+        // Explicit values.
+        let body = BASE.replace(
+            "preserve]\nmetadata = true",
+            "preserve]\nmetadata = true\nstealth = off\nstealth_max_pixels = 0",
+        );
+        let path = write_config(&dir, &body);
+        let config = load(&path, &dir).unwrap();
+        assert!(!config.stealth);
+        assert_eq!(config.stealth_max_pixels, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -626,6 +694,8 @@ mod tests {
         );
         assert!(config.overwrite_existing && config.reuse_unchanged && !config.adopt_untracked);
         assert!(config.preserve_metadata && config.preserve_timestamps);
+        assert!(config.stealth);
+        assert_eq!(config.stealth_max_pixels, DEFAULT_STEALTH_MAX_PIXELS);
         // New optional keys: the template keeps the documented defaults.
         assert!(!config.lossless);
         assert!(!config.exact);

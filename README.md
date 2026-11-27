@@ -95,6 +95,8 @@ cargo build --release --no-default-features --locked
 | `webp.method` | libwebp の method、0〜6（省略時は静止画 4／アニメーション 0） |
 | `webp.exact` | 透明部分の RGB を保持（既定 `false`、静止画のみ） |
 | `output.parallel_jobs` | 同時に処理するジョブ数（省略時は CPU コア数、超過はコア数にクランプ） |
+| `preserve.stealth` | Stealth PNG Info を読み取る（既定 `true`。`false` で無効） |
+| `preserve.stealth_max_pixels` | これを超える画素数の 16bit PNG は Stealth 走査を省略（既定 `16777216`、`0` で無制限） |
 
 Python 版との違いは [`doc/img2webp-rust-implementation.md`](doc/img2webp-rust-implementation.md) §4〜5 にまとめています。主なものは次のとおりです。
 

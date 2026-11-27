@@ -4,6 +4,12 @@
 //! only reachable with a dedicated decoder. This is a port of the Python
 //! implementation's `png_16bit_pixels()` with the same limits (design spec
 //! §1.7, §3.2 `png_raw.rs`).
+//!
+//! The 16-bit scan is the expensive half of Stealth extraction, so decoding can
+//! stop after a given number of rows (`png_16bit_rows`). The Stealth payload
+//! header lives at the start of the bit stream (column-major), so a file
+//! without a payload only needs the first few rows undecoded — this is what
+//! keeps the negative case cheap (design spec §4.2, `stealth_max_pixels`).
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -19,11 +25,16 @@ pub struct Raw16 {
     pub width: usize,
     pub height: usize,
     pub channels: usize,
+    /// Number of decoded (unfiltered) rows; never larger than `height`.
+    pub rows: usize,
 }
 
 impl Raw16 {
     #[inline]
     pub fn sample(&self, x: usize, y: usize, channel: usize) -> u8 {
+        if y >= self.rows {
+            return 0;
+        }
         let stride = self.width * self.channels * 2 + 1;
         self.data[y * stride + 1 + x * self.channels * 2 + channel * 2 + 1]
     }
@@ -33,7 +44,22 @@ fn be_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
+/// Decodes at least the first `rows` rows (all rows when `rows >= height`).
+pub fn png_16bit_rows(path: &Path, rows: usize, interrupt: &Interrupt) -> Option<Raw16> {
+    decode(path, rows, false, interrupt)
+}
+
 pub fn png_16bit_pixels(path: &Path, header_only: bool, interrupt: &Interrupt) -> Option<Raw16> {
+    let rows = if header_only { 152 } else { usize::MAX };
+    decode(path, rows, header_only, interrupt)
+}
+
+fn decode(
+    path: &Path,
+    row_limit: usize,
+    header_only: bool,
+    interrupt: &Interrupt,
+) -> Option<Raw16> {
     let file = File::open(path).ok()?;
     let mut stream = BufReader::with_capacity(64 * 1024, file);
     let mut header = [0u8; 33];
@@ -72,9 +98,10 @@ pub fn png_16bit_pixels(path: &Path, header_only: bool, interrupt: &Interrupt) -
     if expected > MAX_PNG_BYTES {
         return None;
     }
+    let rows = row_limit.clamp(1, height);
+    let needed = (stride + 1).checked_mul(rows)?;
 
-    // Collect the IDAT stream (cumulative size limited like the Python code),
-    // then inflate it with a bound of `expected + 1` bytes.
+    // Collect the IDAT stream (cumulative size limited like the Python code).
     let mut idat: Vec<u8> = Vec::new();
     let mut saw_idat = false;
     let mut ended_idat = false;
@@ -122,12 +149,14 @@ pub fn png_16bit_pixels(path: &Path, header_only: bool, interrupt: &Interrupt) -
         return None;
     }
 
-    let mut decoded: Vec<u8> = Vec::with_capacity(expected + 1);
+    // Inflate only as far as the requested rows (the negative Stealth case stops
+    // here instead of inflating the whole image).
+    let mut decoded: Vec<u8> = Vec::with_capacity(needed + 1);
     {
         use flate2::read::ZlibDecoder;
         let mut decoder = ZlibDecoder::new(&idat[..]);
         let mut buffer = vec![0u8; 64 * 1024];
-        loop {
+        while decoded.len() < needed {
             if interrupt.requested() {
                 return None;
             }
@@ -143,12 +172,12 @@ pub fn png_16bit_pixels(path: &Path, header_only: bool, interrupt: &Interrupt) -
             }
         }
     }
-    if decoded.len() != expected {
+    if decoded.len() < needed {
         return None;
     }
+    decoded.truncate(needed);
 
     let bpp = channels * 2;
-    let rows = if header_only { height.min(152) } else { height };
     let columns = if header_only {
         width.min(152_usize.div_ceil(height))
     } else {
@@ -202,5 +231,6 @@ pub fn png_16bit_pixels(path: &Path, header_only: bool, interrupt: &Interrupt) -
         width,
         height,
         channels,
+        rows,
     })
 }

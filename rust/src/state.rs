@@ -17,7 +17,7 @@ pub const DEV_STATE_DATABASE_NAME: &str = ".img2webp-dev.sqlite3";
 pub const DEV_MARKER_NAME: &str = ".img2webp-dev-output";
 pub const DEV_MARKER_CONTENT: &str = "img2webp development build output folder";
 pub const PIPELINE_COPY: i64 = 2;
-pub const PIPELINE_CONVERT: i64 = 3;
+pub const PIPELINE_CONVERT: i64 = 4;
 
 #[derive(Debug)]
 pub struct DbError(pub String);
@@ -188,6 +188,13 @@ pub fn settings_signature(job: &Job, config: &Config) -> String {
             entries.insert("pipeline", JsonValue::Int(PIPELINE_CONVERT));
             entries.insert("quality", JsonValue::Int(config.quality));
             entries.insert("metadata", JsonValue::Bool(config.preserve_metadata));
+            // Stealth scanning policy changes the generated text, so it is part
+            // of the identity (pipeline 4; see §4.2 `stealth`).
+            entries.insert("stealth", JsonValue::Bool(config.stealth));
+            entries.insert(
+                "stealth_max_pixels",
+                JsonValue::Int(config.stealth_max_pixels),
+            );
             entries.insert("lossless", JsonValue::Bool(config.lossless));
             entries.insert("exact", JsonValue::Bool(config.exact));
             entries.insert("method_still", JsonValue::Int(config.method_still()));
@@ -458,7 +465,7 @@ mod tests {
         let (config, _dir) = fixture_config();
         let png_job = job(&config, "photo.png", Action::Convert);
         let expected = format!(
-            "{{\"action\":\"convert\",\"dependencies\":\"{}\",\"exact\":false,\"libwebp\":\"{}\",\"lossless\":false,\"metadata\":true,\"method_animation\":0,\"method_still\":4,\"missing_duration_ms\":80,\"pipeline\":3,\"platform\":\"{}\",\"quality\":90,\"timestamps\":true}}",
+            "{{\"action\":\"convert\",\"dependencies\":\"{}\",\"exact\":false,\"libwebp\":\"{}\",\"lossless\":false,\"metadata\":true,\"method_animation\":0,\"method_still\":4,\"missing_duration_ms\":80,\"pipeline\":4,\"platform\":\"{}\",\"quality\":90,\"stealth\":true,\"stealth_max_pixels\":16777216,\"timestamps\":true}}",
             env!("IMG2WEBP_DEP_VERSIONS"),
             crate::webp_encode::libwebp_version(),
             if cfg!(windows) { "nt" } else { "posix" },
@@ -475,7 +482,7 @@ mod tests {
         let png_job = job(&config, "photo.png", Action::Convert);
         let signature = settings_signature(&png_job, &config);
         assert!(signature.starts_with("{\"action\":\"convert\","));
-        assert!(signature.contains("\"pipeline\":3"));
+        assert!(signature.contains("\"pipeline\":4"));
         assert!(signature.contains("\"quality\":90"));
         assert!(signature.contains("\"missing_duration_ms\":80"));
         assert!(signature.contains("\"method_still\":4"));

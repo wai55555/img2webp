@@ -13,6 +13,10 @@ use crate::probe::{Format, Probe};
 
 pub const MAX_STEALTH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SIDE: u32 = 16384;
+/// Bits needed for the 15-byte payload signature (`stealth_png`/`stealth_rgb`
+/// plus `info`/`comp`). Reading this prefix decides whether a 16-bit PNG even
+/// has a payload, so the rest of the image does not have to be decoded.
+const SIGNATURE_BITS: usize = 120;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Slot {
@@ -182,62 +186,70 @@ pub fn stealth_text(
     run_modes(&sampler, &modes, width, height, interrupt)
 }
 
-fn stealth_text_16(path: &Path, _probe: &Probe, interrupt: &Interrupt) -> String {
-    let Some(header) = png_raw::png_16bit_pixels(path, true, interrupt) else {
-        return String::new();
+fn stealth_text_16(path: &Path, probe: &Probe, interrupt: &Interrupt) -> String {
+    let channels = match probe.color_type {
+        2 => 3usize,
+        4 => 2,
+        6 => 4,
+        _ => return String::new(),
     };
-    let modes: Vec<&Mode> = match header.channels {
+    let modes: Vec<&Mode> = match channels {
         2 => vec![&ALPHA_MODE],
         4 => vec![&ALPHA_MODE, &RGB_MODE],
         _ => vec![&RGB_MODE],
     };
-    let width = header.width;
-    let height = header.height;
-    let mut full: Option<Raw16> = None;
-    for (index, mode) in modes.iter().enumerate() {
+    let width = probe.width as usize;
+    let height = probe.height as usize;
+    if width == 0 || height == 0 {
+        return String::new();
+    }
+    for mode in &modes {
         let slots = mode.slots.len();
         let capacity = width.saturating_mul(height).saturating_mul(slots);
         if capacity < 152 {
             continue;
         }
-        let header_sampler = RawSampler { raw: &header };
-        let Some(head) = read_bits(&header_sampler, slots, width, height, 0, 152, interrupt) else {
+        // Stage 1: only the rows that hold the 15-byte signature header are
+        // decoded. A file without a payload stops here (negative case, design
+        // spec §4.2 `stealth_max_pixels`), instead of inflating the whole IDAT.
+        let signature_rows = SIGNATURE_BITS.div_ceil(slots).clamp(1, height);
+        let Some(prefix) = png_raw::png_16bit_rows(path, signature_rows, interrupt) else {
+            return String::new();
+        };
+        let sampler = RawSampler { raw: &prefix };
+        let Some(head) = read_bits(&sampler, slots, width, height, 0, SIGNATURE_BITS, interrupt)
+        else {
             continue;
         };
         let mut expected = mode.prefix.to_vec();
         expected.extend_from_slice(b"info");
         let mut compressed_expected = mode.prefix.to_vec();
         compressed_expected.extend_from_slice(b"comp");
-        let head_prefix = &head[..15];
-        let compressed = if head_prefix == compressed_expected.as_slice() {
+        let compressed = if head.as_slice() == compressed_expected.as_slice() {
             true
-        } else if head_prefix == expected.as_slice() {
+        } else if head.as_slice() == expected.as_slice() {
             false
         } else {
             continue;
         };
-        let length = u32::from_be_bytes([head[15], head[16], head[17], head[18]]) as usize;
+        // A validated signature triggers the full decode for the length field
+        // and the payload; a failure here ends the scan without trying the next
+        // mode (unlike the 8-bit path).
+        let Some(raw) = png_raw::png_16bit_pixels(path, false, interrupt) else {
+            return String::new();
+        };
+        let full_sampler = RawSampler { raw: &raw };
+        let Some(header) = read_bits(&full_sampler, slots, width, height, 0, 152, interrupt) else {
+            return String::new();
+        };
+        let length = u32::from_be_bytes([header[15], header[16], header[17], header[18]]) as usize;
         if length % 8 != 0 || length > MAX_STEALTH_BYTES * 8 || 152 + length > capacity {
             continue;
-        }
-        // A validated header triggers the full decode; a failure here ends the
-        // scan without trying the next mode (unlike the 8-bit path).
-        if full.is_none() {
-            let _ = index;
-            match png_raw::png_16bit_pixels(path, false, interrupt) {
-                Some(raw) => full = Some(raw),
-                None => return String::new(),
-            }
         }
         let payload = if length == 0 {
             Vec::new()
         } else {
-            let raw = match &full {
-                Some(raw) => raw,
-                None => return String::new(),
-            };
-            let sampler = RawSampler { raw };
-            match read_bits(&sampler, slots, width, height, 152, length, interrupt) {
+            match read_bits(&full_sampler, slots, width, height, 152, length, interrupt) {
                 Some(bytes) => bytes,
                 None => continue,
             }
@@ -332,6 +344,28 @@ mod tests {
         let decoded = image::open(&path).unwrap().to_rgba8();
         let pixels = Pixels::Rgba(decoded);
         stealth_text(&probe, &path, Some(&pixels), &interrupt)
+    }
+
+    #[test]
+    fn sixteen_bit_prefix_matches_the_full_decode() {
+        let path = fixture("stealth-16-6-alpha-gzip-2.png");
+        let interrupt = Interrupt::new();
+        let full = png_raw::png_16bit_pixels(&path, false, &interrupt).unwrap();
+        for rows in [1usize, 40, 120, full.height] {
+            let prefix = png_raw::png_16bit_rows(&path, rows, &interrupt).unwrap();
+            assert_eq!(prefix.rows, rows.min(full.height), "rows={rows}");
+            for y in 0..prefix.rows.min(8) {
+                for x in 0..4.min(prefix.width) {
+                    for channel in 0..prefix.channels {
+                        assert_eq!(
+                            prefix.sample(x, y, channel),
+                            full.sample(x, y, channel),
+                            "x={x} y={y} c={channel} rows={rows}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

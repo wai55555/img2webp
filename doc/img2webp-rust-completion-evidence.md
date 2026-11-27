@@ -548,3 +548,76 @@ $ .venv/bin/python rust/tests/compare_with_python.py crc-mismatch.png   # CRC �
 ```
 
 作業用の一時物（リポジトリ外／gitignore 済み）: `%TEMP%\img2webp-smoke2-20261127-201233`、`.bench/corpus/{cat1,cat2,cat3,cat3big,cat1x10,cat8x10,apng-long,empty}`、`.bench/tmp/`、`.bench/parallel-*.json`、`/tmp/cmp*.log`。
+
+---
+
+# 11. Stealth 走査の是正（A＋設定項目）
+
+2026-11-27 の利用者決定「A（早期打ち切り）＋ config.ini オプション」に基づく実装と再計測。§6.1 で未達と判定した Phase 3 完了条件（Stealth 負ケースのコストが変換本体の 10% 以内）を、基準を緩めずに満たした。
+
+## 11.1 実装
+
+| 変更 | ファイル | 内容 |
+| --- | --- | --- |
+| 16bit 走査の 2 段化 | `rust/src/png_raw.rs`、`rust/src/stealth.rs` | ペイロードのシグネチャは先頭 120 ビット（15 バイト）で判定できる。第 1 段はその 120 ビットが載る行数（`ceil(120 / slots)`、最大 `height`）だけを復号し、シグネチャが一致しなければそこで打ち切る（IDAT の全展開も全行走査もしない）。一致したときだけ従来どおり全体を復号して長さとペイロードを読む。`png_raw::png_16bit_rows` が行数指定の復号を提供し、`png_16bit_pixels(header_only)` は同じ内部実装を使う |
+| 設定項目 | `rust/src/config.rs`、`config.ini`、`rust/tests/fixtures/config-fixture.ini` | `[preserve] stealth`（既定 `true`、`false` で走査せず WARN）、`[preserve] stealth_max_pixels`（既定 `16,777,216` 画素、超過する 16bit は走査を省略して WARN、`0` で無制限）。どちらも省略可能（設計書 §5 の新項目の規則どおり） |
+| 適用箇所 | `rust/src/convert.rs::skip_stealth_scan` | 上限判定は 16bit PNG のみ。8bit の走査は元から十分安いので上限の対象外（`stealth = false` は全体に効く） |
+| 変換シグネチャ | `rust/src/state.rs` | 生成テキストが変わるため `stealth`／`stealth_max_pixels` を署名に含め、`pipeline` を **4** に上げた（既存の変換記録は一度だけ作り直し） |
+
+`git diff` の本番コードはこの 5 ファイル（`config.rs`／`convert.rs`／`png_raw.rs`／`stealth.rs`／`state.rs`）のみ。
+
+## 11.2 再計測（同一ファイルの Stealth on/off、`profile_pipeline`、7 回の中央値）
+
+| コーパス | 変換本体（off） | Stealth 走査 | 本体比 | 是正前 |
+| --- | --- | --- | --- | --- |
+| `cat1`（AI PNG 40 件・8bit・ペイロード無し） | 109.366 ms | 0.113 ms | **0.10%** | 0.09% |
+| `cat3`（16bit 256×256 10 件・ペイロード無し） | 46.377 ms | 2.589 ms | **5.58%** | 19.0% |
+| `cat3big`（16bit 1024×1024 3 件・ペイロード無し） | 191.186 ms | 7.159 ms | **3.74%** | 20.6% |
+
+すべて §4.2 の基準（10% 以内）を満たす。**基準は変更していない**（緩和なし）。
+
+上限設定の動作確認（`stealth_max_pixels = 1000` で 1024×1024 の 16bit 3 件）:
+
+```
+CONVERT big16-0.png -> big16-0.webp
+WARN big16-0.png: Stealth PNG Info の走査を省略しました（1024x1024 = 1048576 画素は上限 1000 画素を超えています）
+完了: 変換 3 / コピー 0 / 再利用 0 / 登録 0 / 失敗 0
+```
+
+変換は成功し、隠しテキストだけが引き継がれない（WARN で明示）。`stealth = false` でも同じく WARN を出して省略する。
+
+## 11.3 回帰確認
+
+```
+$ cargo test                       # 48 unit + 14 behaviour + 36 e2e = 98 件、失敗 0
+$ cargo test --no-default-features # 同じ件数、失敗 0
+$ python3 doc/tools/check_spec_references.py    # all cross references resolve
+```
+
+- 画素等価性: `compare_with_python.py` は**比較可能な 36 ケース中 34 ケースが完全等価**、差分 2 件（16bit APNG＝意図的な失敗、`cmyk-icc.jpg`＝基準内の ICC 4 バイト差）。16bit Stealth の 5 フィクスチャはすべて一致（ペイロード抽出結果も一致）
+- 追加テスト: `stealth::sixteen_bit_prefix_matches_the_full_decode`（部分復号と全体復号の画素一致）、`config::stealth_keys_default_and_accept_zero_as_unlimited`、`e2e::stealth_scan_is_skipped_above_the_pixel_cap`、`e2e::stealth_scan_can_be_disabled_in_the_config`、`state::convert_signature_shape_is_pinned`（pipeline 4 のゴールデン）
+
+## 11.4 測定側で見つかった欠陥（比較スクリプト）
+
+`compare_with_python.py` は、テンプレートに無い設定（`lossless`／`exact`／`method`）のパッチを黙って捨てていた。つまり §6.2 まで「lossless／exact／method0 の変種で一致」としていた記述は、**既定設定どうしを比較していただけ**で、その設定を検証していなかった。
+
+- 修正: パッチを該当セクションに挿入する（`patched_config(..., for_python=...)`）。Python 版が表現できない設定は Python 側の設定から除去し、それを使う 6 ケースは `[RUST-ONLY]` として比較対象外にした（`tests/e2e.rs` が個別に検証する）
+- したがって件数の読み替え: 旧「42 ケース中 40 等価」→ 新「比較可能 36 ケース中 34 等価（＋Rust 専用 6 ケース）」。等価でない 2 件の内訳は変わらない
+- 残る改善候補（決定依頼 §8-5）: 合格基準（ICC の 4 バイト差の許容）をスクリプトに実装して終了コードを意味のあるものにする
+
+## 11.5 仕様上の注意（利用者向け）
+
+- `stealth = false` または上限超過で走査を省略すると、**Stealth PNG Info の隠しテキストは WebP に引き継がれない**（画素・Exif・ICC・XMP は通常どおり）。WARN 行で必ず通知する
+- 既定（`stealth = true`／16,777,216 画素）では、4096×4096 までの 16bit PNG が従来どおり走査される
+- 設定を変えると変換シグネチャが変わるため、次回実行時に変換済みファイルが一度だけ作り直される（コピーは再利用される）
+
+## 11.6 依然として残る決定依頼（§8 の更新）
+
+| # | 項目 | 状態 |
+| --- | --- | --- |
+| 8-1 | Stealth 16bit 負ケースの 10% 基準 | **解決**（A の実装で 5.3%/3.7% を達成。基準は据え置き） |
+| 8-2 | PNG の CRC 不一致で Pillow と挙動が違う | 未決（現状は Rust が失敗側。`png` クレートの CRC 検証を切るか、意図的な変更として §5 に載せるか） |
+| 8-3 | GIF 頻度の標本調査 | 未実施（実入力フォルダの指定が必要） |
+| 8-4 | FFI 周りの RAII ガード | 未実施（タグ済み成果物を変えるため保留。§6.3 のとおり現行は到達不能） |
+| 8-5 | 比較スクリプトの終了コード | 未実施（§11.4） |
+| 8-6 | 配布 exe の再生成 | 記録済み（`--locked` 確認ビルドで 2026-11-27 20:12 に再生成。本番コードの差分なし。今回の Stealth 変更でさらに再ビルドされる） |

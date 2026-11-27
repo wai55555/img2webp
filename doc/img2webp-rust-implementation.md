@@ -57,8 +57,8 @@ cargo test --no-default-features                       # リリース相当の�
 
 | 完了条件 | 証跡 |
 | --- | --- |
-| コピーと静止画変換の black-box 相当テスト | `tests/e2e.rs`（34 件、2026-11-27 照合時の実測。CRC フィクスチャの 1 件を追加） |
-| 再構成した単体テスト | `src/*.rs` の単体テスト（46 件、同じく照合時の実測。FFI パニック安全性の 2 件を追加） |
+| コピーと静止画変換の black-box 相当テスト | `tests/e2e.rs`（36 件、2026-11-27 実測。CRC と Stealth 設定の 3 件を追加） |
+| 再構成した単体テスト | `src/*.rs` の単体テスト（48 件、同じく実測。FFI パニック安全性 2 件・16bit プリフィクス一致 1 件・Stealth 設定 1 件を追加） |
 | Python 製 DB の複製でコピー再利用・変換の一度きりの再作成 | `tests/behaviour.rs::python_database_copy_records_are_reused_and_conversions_rebuilt` |
 | 待機制御（先着順・後続停止・リコンサイル） | `tests/behaviour.rs::jobs_wait_for_budget_without_losing_work`、`lost_completion_notification_is_reclaimed_by_reconcile`、`src/budget.rs` の単体テスト |
 | 同梱 config.ini テンプレとコード既定値の一致 | `src/config.rs::bundled_template_matches_code_defaults` |
@@ -93,8 +93,9 @@ cargo test --no-default-features                       # リリース相当の�
 | --- | --- |
 | Stealth 全バリエーション | `src/stealth.rs::all_variants_are_extracted`（8/16bit × RGB/RGBA/LA × info/gzip/zlib × フィルタ 0〜4） |
 | 不正ペイロード・制限・切り詰め | `invalid_payloads_return_empty`、`tests/e2e.rs::stealth_payloads_become_user_comments` |
+| Stealth の設定項目（`stealth`／`stealth_max_pixels`） | `src/config.rs` の単体テスト（既定値・`0` で無制限・型検証）、`tests/e2e.rs::stealth_scan_is_skipped_above_the_pixel_cap`、`stealth_scan_can_be_disabled_in_the_config` |
 | APNG の Stealth がフレーム巡回前の先頭フレームから読まれる | `src/convert.rs` が `decode_still`（開いた直後のフレーム）から抽出し、生成テキストへ結合。`tests/e2e.rs::stealth_payloads_become_user_comments` が変換を通した結合を確認 |
-| 負ケースのコスト計測 | **未達（2026-11-27 再計測）**。`rust/examples/profile_pipeline.rs` で同一ファイルの Stealth 走査 on/off を比較した結果、8bit 負ケース（AI PNG 40 件）は変換本体の 0.09%（基準内）、16bit 負ケース（256×256 10 件）は 19.0%、1024×1024 3 件では 20.6% となり、設計書 §4.2 の「変換本体の 10% 以内」を満たさない。旧記述の「カテゴリ 2 と 1 の差」は別コーパス間の比較で、判定に使えない（`img2webp-rust-completion-evidence.md` §6）。是正するか基準の適用範囲を見直すかは**決定依頼** |
+| 負ケースのコスト計測 | **達成（2026-11-27 の是正後）**。16bit 走査を「シグネチャ 120 ビット分の行だけ復号する」方式に変更（`png_raw::png_16bit_rows`＋`stealth_text_16` の 2 段化）し、同一ファイルの on/off 比較（`rust/examples/profile_pipeline.rs`）で **8bit 0.10%／16bit 256×256 5.3%／16bit 1024×1024 3.7%**（変換本体比、基準 10%）を得た。加えて `[preserve] stealth_max_pixels`（既定 16,777,216 画素）を超える 16bit は走査を省略して WARN を出す（`stealth = false` で全面無効）。詳細は `img2webp-rust-completion-evidence.md` の「11. Stealth 走査の是正」 |
 
 ### Phase 4（アニメーション）
 
@@ -141,16 +142,16 @@ cargo test --no-default-features                       # リリース相当の�
 
 ## 3. 変換シグネチャのゴールデン文字列
 
-### Phase 1 時点の暫定形（履歴）
+### Phase 1 時点の暫定形（履歴。`pipeline` は 3 で固定していた）
 
 ```
-{"action":"convert","exact":false,"lossless":false,"metadata":true,"method_animation":0,"method_still":4,"missing_duration_ms":80,"pipeline":3,"platform":"nt","quality":90,"timestamps":true}
+{"action":"convert","exact":false,"lossless":false,"metadata":true,"method_animation":0,"method_still":4,"missing_duration_ms":80,"pipeline":4,"platform":"nt","quality":90,"stealth":true,"stealth_max_pixels":16777216,"timestamps":true}
 ```
 
 ### 最終形（現行）
 
 ```
-{"action":"convert","dependencies":"image=0.25.10;png=0.18.1;gif=0.14.2;zune-jpeg=0.5.15;zune-core=0.5.3;image-webp=0.2.4;jpeg-decoder=0.3.2;libwebp-sys=0.14.4;rusqlite=0.37.0;lcms2=6.3.0;lcms2-sys=4.2.0;flate2=1.1.11;miniz_oxide=0.8.9","exact":false,"libwebp":"1.6.0","lossless":false,"metadata":true,"method_animation":0,"method_still":4,"missing_duration_ms":80,"pipeline":3,"platform":"nt","quality":90,"timestamps":true}
+{"action":"convert","dependencies":"image=0.25.10;png=0.18.1;gif=0.14.2;zune-jpeg=0.5.15;zune-core=0.5.3;image-webp=0.2.4;jpeg-decoder=0.3.2;libwebp-sys=0.14.4;rusqlite=0.37.0;lcms2=6.3.0;lcms2-sys=4.2.0;flate2=1.1.11;miniz_oxide=0.8.9","exact":false,"libwebp":"1.6.0","lossless":false,"metadata":true,"method_animation":0,"method_still":4,"missing_duration_ms":80,"pipeline":4,"platform":"nt","quality":90,"stealth":true,"stealth_max_pixels":16777216,"timestamps":true}
 ```
 
 コピー（Python 版とバイト一致、移行後も再利用される）:
@@ -169,7 +170,7 @@ cargo test --no-default-features                       # リリース相当の�
 | # | 変更 | 実装 | テスト |
 | --- | --- | --- | --- |
 | 1 | 出力の権限が umask 準拠（BUG-04） | `fs_util::create_temp`（POSIX は 0o666、Windows は既定 ACL） | POSIX の単体テスト、Windows は `icacls` で確認 |
-| 2 | 変換ジョブのシグネチャ拡張による一度きりの再変換 | `state::settings_signature`（pipeline 3＋識別） | `tests/behaviour.rs` の Python DB 互換テスト |
+| 2 | 変換ジョブのシグネチャ拡張による一度きりの再変換 | `state::settings_signature`（pipeline 4＋識別＋Stealth 設定） | `tests/behaviour.rs` の Python DB 互換テスト |
 | 3 | 一辺 16,384px は処理前に失敗（BUG-07） | `dispatch::check_limits` | `tests/e2e.rs::dimension_and_pixel_limits_fail_the_job` |
 | 4 | 設定エラーで missing と unknown の両方 | `config::load` | `src/config.rs::rejects_missing_and_unknown_keys_together` |
 | 5 | メモリ予算の導入 | `budget.rs` + `dispatch.rs` | 予算超過・待機のテスト |
@@ -181,6 +182,7 @@ cargo test --no-default-features                       # リリース相当の�
 | 11 | 標準出力・標準エラーは UTF-8 | Rust の `println!`/`eprintln!`（`Reporter`） | 全テスト（日本語文言） |
 | 12 | 整数のアンダースコア・Unicode 数字を受理しない | `config::parse_int` | `src/config.rs::validates_ranges_and_types` |
 | 13 | 標準出力・標準エラーへの書き込み失敗はジョブ成否に数えない | `Reporter`（失敗したら以後の表示を打ち切る） | 実装のみ（パイプ切断の自動テストなし） |
+| 15 | Stealth 走査の設定（`stealth`／`stealth_max_pixels`）を追加し、上限超過の 16bit PNG は走査を省略して WARN を出す（2026-11-27 の利用者決定。§4.2） | `src/convert.rs::skip_stealth_scan`、`src/config.rs` | `tests/e2e.rs::stealth_scan_is_skipped_above_the_pixel_cap`、`stealth_scan_can_be_disabled_in_the_config` |
 | 14 | ディスパッチャ／FFI パニック時は最終 commit なし | `dispatch::run` の `catch_unwind`、`webp_encode::FFI_ACTIVE` | ディスパッチャ／FFI パニックの注入は未実施（ワーカーパニックは試験済み） |
 
 ## 5. 設計書からの差異（実装時に確定したもの）
@@ -198,7 +200,8 @@ cargo test --no-default-features                       # リリース相当の�
 11. **FFI フラグのスレッドローカル化**: libwebp 呼び出し中フラグをプロセス全体（原子変数）ではなくスレッドローカルにした。並列実行時、別ジョブの FFI 呼び出し中に起きた純 Rust パニックを「FFI パニック（プロセス終了）」と誤判定しないため（テストで発見）。
 12. **UNC 出力の WAL フォールバック**: SMB 上では SQLite の WAL 共有メモリを作れないため、`journal_mode=WAL` の設定後に最初の書き込みが共有メモリ関連の I/O エラーになった場合だけ `journal_mode=DELETE` に切り替え、WARN を出して続行する（ローカルフォルダでは WAL のまま）。`StateDb::wal_enabled()` で検出する。
 13. **テスト用フック**: `dispatch::Options` に `hook`/`interrupt_after`/`second_interrupt_after`/`commit_hook`/`faults`/`budget_override`/`parallel_override`/`cleanup_min_age`/`now`/`stagnation_timeout` を持つ。バイナリは既定値のまま使うため、本番に差し替え経路は無い。
-14. **安全係数**: 2.0 で確定（§2 Phase 5 の「安全係数の確定」行。実測との比較で据え置きを決定）。以前ここに「2.0 の暫定のまま（Phase 5 の確定項目は未達）」と書いていたが、設計書 §6 Phase 0 が「安全係数は暫定値の決定をもって Phase 0 の決着範囲とする」と定めており、Phase 5 で実測比較のうえ据え置きを決めたため、確定として扱う。
+14. **Stealth 走査の 2 段化と設定項目**: 16bit はシグネチャの 120 ビット分の行だけ復号して判定し、ペイロードが無ければ全展開しない（負ケースのコストを 19〜21% から 5.3%/3.7% へ）。`stealth`／`stealth_max_pixels` を追加し、`pipeline` を 4 に上げた。設定が出力（生成テキスト）に効くため、既存の変換記録は一度だけ作り直しになる。
+15. **安全係数**: 2.0 で確定（§2 Phase 5 の「安全係数の確定」行。実測との比較で据え置きを決定）。以前ここに「2.0 の暫定のまま（Phase 5 の確定項目は未達）」と書いていたが、設計書 §6 Phase 0 が「安全係数は暫定値の決定をもって Phase 0 の決着範囲とする」と定めており、Phase 5 で実測比較のうえ据え置きを決めたため、確定として扱う。
 
 ### 5.1 エンコーダ設定の掃引（コーパス 1＋7、Rust のみ、2 回の中央値）
 
@@ -221,7 +224,7 @@ cargo test --no-default-features                       # リリース相当の�
 ## 6. テスト実行結果
 
 ```
-cargo test                        # 46 unit + 14 behaviour + 34 e2e = 94 件、失敗 0
+cargo test                        # 48 unit + 14 behaviour + 36 e2e = 98 件、失敗 0
 cargo test --no-default-features  # 同じ件数（リリース相当の読み替え）
 python3 doc/tools/check_spec_references.py  # 設計書の相互参照はすべて解決
 ```
@@ -236,4 +239,6 @@ python3 doc/tools/check_spec_references.py  # 設計書の相互参照はすべ�
 - コールド I/O 状態での計測（OS のキャッシュ制御ができず未実施）。
 - 安全係数は実測との比較で 2.0 を維持すると決めたが、長尺アニメーションの実コーパスでの再確認は未実施。
 
-Python 版との出力比較（`rust/tests/compare_with_python.py`、**42 ケース**）は 40 ケースが完全等価、差分は 2 ケース。内訳は 16bit APNG（設計どおりの意図的な失敗）と `cmyk-icc.jpg`（ICC の 4 バイト差＝sRGB プロファイル作成日時で、§3.1 の合格基準内）。スクリプトは合格基準を実装していないため、基準内の差でも終了コード 1 を返す。
+Python 版との出力比較（`rust/tests/compare_with_python.py`）は**比較可能な 36 ケース中 34 ケースが完全等価**、差分は 2 ケース。内訳は 16bit APNG（設計どおりの意図的な失敗）と `cmyk-icc.jpg`（ICC の 4 バイト差＝sRGB プロファイル作成日時で、§3.1 の合格基準内）。
+
+**照合で判明した測定側の欠陥を修正**: 旧スクリプトは、テンプレートに無い設定（`lossless`/`exact`/`method`）のパッチを黙って捨てていたため、lossless／exact／method0 の 6 ケースは実際には既定設定どうしの比較（＝無意味な一致）だった。設定をセクションに挿入するよう修正し、Python 版が表現できない設定（`lossless`/`exact`/`method`/`parallel_jobs`/`stealth`/`stealth_max_pixels`）を使う 6 ケースは `[RUST-ONLY]` として比較対象から外した（これらは `tests/e2e.rs` で個別に検証する）。スクリプトは合格基準を実装していないため、基準内の差でも終了コード 1 を返す。

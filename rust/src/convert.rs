@@ -277,7 +277,18 @@ pub fn convert(
         Decoded::Pixels(pixels, _) => Some(pixels.clone()),
         Decoded::Cmyk(_) => None,
     };
-    let hidden = stealth::stealth_text(probe, source, first_pixels.as_ref(), interrupt);
+    let mut stealth_warnings: Vec<String> = Vec::new();
+    let hidden = if !config.stealth {
+        stealth_warnings.push(
+            "Stealth PNG Info の読み取りが設定で無効になっているため、隠しテキストは引き継ぎません"
+                .to_string(),
+        );
+        String::new()
+    } else if skip_stealth_scan(probe, config, &mut stealth_warnings) {
+        String::new()
+    } else {
+        stealth::stealth_text(probe, source, first_pixels.as_ref(), interrupt)
+    };
     let prepared = metadata::prepare(probe, config, &hidden).map_err(JobError::Conversion)?;
     let start_index = if probe.format == Format::Png && probe.is_apng && probe.apng_default_image {
         1
@@ -363,6 +374,7 @@ pub fn convert(
             output_icc,
             config,
             destination,
+            &stealth_warnings,
         )
     } else if let Some(first) = animation_frames.into_iter().next() {
         let frame = color::apply_orientation(first, prepared.orientation);
@@ -389,6 +401,7 @@ pub fn convert(
             output_icc,
             config,
             destination,
+            &stealth_warnings,
         )
     } else {
         let single = match decoded {
@@ -424,8 +437,30 @@ pub fn convert(
             output_icc,
             config,
             destination,
+            &stealth_warnings,
         )
     }
+}
+
+/// Applies the Stealth scanning policy for the expensive 16-bit path: above
+/// `stealth_max_pixels` the scan is skipped and a warning is reported
+/// (design spec §4.2; `0` disables the limit).
+fn skip_stealth_scan(probe: &Probe, config: &Config, warnings: &mut Vec<String>) -> bool {
+    if config.stealth_max_pixels <= 0 {
+        return false;
+    }
+    if probe.format != Format::Png || probe.bit_depth != 16 {
+        return false;
+    }
+    let pixels = probe.width as i64 * probe.height as i64;
+    if pixels <= config.stealth_max_pixels {
+        return false;
+    }
+    warnings.push(format!(
+        "Stealth PNG Info の走査を省略しました（{}x{} = {} 画素は上限 {} 画素を超えています）",
+        probe.width, probe.height, pixels, config.stealth_max_pixels
+    ));
+    true
 }
 
 fn finish(
@@ -435,8 +470,9 @@ fn finish(
     output_icc: Option<Vec<u8>>,
     config: &Config,
     destination: &Path,
+    extra_warnings: &[String],
 ) -> Result<Vec<String>, JobError> {
-    let mut warnings = Vec::new();
+    let mut warnings = extra_warnings.to_vec();
     let mut output = data;
     if config.preserve_metadata {
         let exif_bytes = prepared

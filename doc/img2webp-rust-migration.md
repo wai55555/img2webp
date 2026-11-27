@@ -10,7 +10,7 @@
 
 - 主対象は Windows。Rust 版は単一 exe（CRT・libwebp・lcms2・SQLite を静的リンク）。
 - 設定ファイルの場所は変えない。**exe の配置フォルダが `config.ini` と状態 DB の基準フォルダ**になる（`config.ini` は exe の隣、状態 DB は出力フォルダ内）。移行前と配置が変わると、設定と履歴が別の場所を指して移行が静かに不発になる。**移行前と同じフォルダに exe を置くこと。**
-- `config.ini` は現行のまま動く。新しい任意項目（`[webp] lossless`/`method`/`exact`、`[output] parallel_jobs`）は省略可能で、省略時は現行と同じ挙動（lossless 無効、method 静止画 4／アニメーション 0、exact 無効、並列度は自動）。
+- `config.ini` は現行のまま動く。新しい任意項目（`[webp] lossless`/`method`/`exact`、`[output] parallel_jobs`、`[preserve] stealth`/`stealth_max_pixels`）は省略可能で、省略時は現行と同じ挙動（lossless 無効、method 静止画 4／アニメーション 0、exact 無効、並列度は自動、Stealth 走査は有効・上限 16,777,216 画素）。
 
 ## 2. 移行手順
 
@@ -51,7 +51,7 @@
 1. 処理を止める。
 2. 移行時に取ったバックアップから、状態 DB 一式と出力フォルダを復元する。
    - 「Rust 版の出力をそのまま残す」場合は復元しない。ただし `overwrite_existing = false` のままだと宛先が存在するため Python 版は再変換しない（`true` にすると再変換される）。
-3. `config.ini` から新しい任意項目（`lossless`／`method`／`exact`／`parallel_jobs`）を削除する。Python 版は未知キーを設定エラーにする。
+3. `config.ini` から新しい任意項目（`lossless`／`method`／`exact`／`parallel_jobs`／`stealth`／`stealth_max_pixels`）を削除する。Python 版は未知キーを設定エラーにする。
 4. `img2webp.exe` を退避し、タグ `python-version-final` の `img2webp.py`・`img2webp.bat`・`config.ini` を元のフォルダへ戻す。
    ```shell
    git show python-version-final:img2webp.py > img2webp.py

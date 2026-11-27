@@ -141,22 +141,55 @@ def describe_exif(info: dict) -> dict:
     return out
 
 
-def patched_config(patches: dict[str, str]) -> bytes:
-    text = CONFIG.read_text(encoding="utf-8")
-    if not patches:
-        return text.encode("utf-8")
-    out = []
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        matched = False
-        for key, value in patches.items():
+# Settings the Python implementation does not know about. They are dropped from
+# the Python side (its config parser rejects unknown keys) and the variants that
+# need them are compared Rust-only.
+RUST_ONLY_KEYS = {
+    "lossless": "[webp]",
+    "method": "[webp]",
+    "exact": "[webp]",
+    "parallel_jobs": "[output]",
+    "stealth": "[preserve]",
+    "stealth_max_pixels": "[preserve]",
+}
+RUST_ONLY_VARIANTS = {"lossless", "exact", "method0"}
+
+
+def patched_config(patches: dict[str, str], for_python: bool = False) -> bytes:
+    """Builds a config.ini for one side.
+
+    Patches are applied to the existing line when there is one and inserted in
+    the right section otherwise, so a variant really changes the setting (the
+    first version of this script silently ignored settings that the template did
+    not list). The Python side drops the Rust-only keys.
+    """
+    lines = CONFIG.read_text(encoding="utf-8").splitlines()
+    if for_python:
+        lines = [
+            line
+            for line in lines
+            if not any(
+                line.strip().startswith(f"{key} =") or line.strip().startswith(f"{key}=")
+                for key in RUST_ONLY_KEYS
+            )
+        ]
+    for key, value in patches.items():
+        if for_python and key in RUST_ONLY_KEYS:
+            continue
+        replaced = False
+        for index, line in enumerate(lines):
+            stripped = line.strip()
             if stripped.startswith(f"{key} =") or stripped.startswith(f"{key}="):
-                out.append(f"{key} = {value}\n")
-                matched = True
+                lines[index] = f"{key} = {value}"
+                replaced = True
                 break
-        if not matched:
-            out.append(line)
-    return "".join(out).encode("utf-8")
+        if replaced:
+            continue
+        section = RUST_ONLY_KEYS.get(key)
+        if section is None:
+            raise SystemExit(f"cannot place config key {key}")
+        lines.insert(lines.index(section) + 1, f"{key} = {value}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def compare_fixture(name: str, root: Path, patches: dict[str, str] = None, tag: str = "") -> dict:
@@ -168,7 +201,9 @@ def compare_fixture(name: str, root: Path, patches: dict[str, str] = None, tag: 
     for project in (py_project, rs_project):
         (project / "inputs").mkdir(parents=True, exist_ok=True)
         shutil.copy(source, project / "inputs" / name)
-        (project / "config.ini").write_bytes(patched_config(patches))
+        (project / "config.ini").write_bytes(
+            patched_config(patches, for_python=project is py_project)
+        )
     shutil.copy(ROOT / "img2webp.py", py_project / "img2webp.py")
     shutil.copy(RUST_EXE, rs_project / "img2webp.exe")
 
@@ -270,6 +305,7 @@ def main() -> int:
         print("build with: cargo build --release --no-default-features", file=sys.stderr)
         return 2
     reports = []
+    skipped: list[str] = []
     temporary = ROOT / ".compare-tmp"
     shutil.rmtree(temporary, ignore_errors=True)
     temporary.mkdir(parents=True)
@@ -280,6 +316,11 @@ def main() -> int:
             for name in fixtures:
                 if not (FIXTURES / name).exists():
                     print(f"missing fixture {name}", file=sys.stderr)
+                    continue
+                if tag in RUST_ONLY_VARIANTS:
+                    # The Python implementation cannot express these settings, so
+                    # only the Rust side can run them (covered by tests/e2e.rs).
+                    skipped.append(f"{name} [{tag}]")
                     continue
                 reports.append(compare_fixture(name, root, patches, tag))
     finally:
@@ -332,7 +373,12 @@ def main() -> int:
             print(f"    byte-identical outputs: {identical}/{compared}")
         for problem in problems:
             print(f"    ! {problem}")
-    print(f"\n{len(reports) - failures}/{len(reports)} fixtures equivalent")
+    for label in skipped:
+        print(f"[RUST-ONLY] {label} (Python 版に該当設定が無いため比較対象外)")
+    print(
+        f"\n{len(reports) - failures}/{len(reports)} fixtures equivalent "
+        f"({len(skipped)} rust-only cases excluded)"
+    )
     return 0 if failures == 0 else 1
 
 

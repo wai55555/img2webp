@@ -133,17 +133,15 @@ fn config_text_patches(patches: &[(&str, &str)]) -> String {
             }
         }
         if !replaced {
-            if *key == "lossless" || *key == "method" || *key == "exact" {
-                // New optional keys go in the [webp] section.
-                let index = lines
-                    .iter()
-                    .position(|l| l.trim() == "[animation]")
-                    .unwrap();
-                lines.insert(index, format!("{key} = {value}"));
-            } else {
-                let index = lines.iter().position(|l| l.trim() == "[preserve]").unwrap();
-                lines.insert(index, format!("{key} = {value}"));
-            }
+            // Optional keys that the fixture does not list go into their own
+            // section, right after the header.
+            let section = match *key {
+                "lossless" | "method" | "exact" => "[webp]",
+                "parallel_jobs" => "[output]",
+                _ => "[preserve]",
+            };
+            let index = lines.iter().position(|l| l.trim() == section).unwrap();
+            lines.insert(index + 1, format!("{key} = {value}"));
         }
     }
     let mut text = lines.join("\n");
@@ -596,6 +594,50 @@ fn mismatched_extension_is_reported() {
     assert!(!project.out_dir().join("wrong.webp").exists());
 }
 
+/// The 16-bit Stealth scan is the expensive half, so a pixel limit can skip it
+/// (design spec §4.2 `stealth_max_pixels`). Defaults keep scanning enabled.
+#[test]
+fn stealth_scan_is_skipped_above_the_pixel_cap() {
+    let project = Project::new("stealth-cap");
+    project.configure(&[("stealth_max_pixels", "1")]);
+    project.copy_fixture("stealth-16-6-alpha-gzip-2.png");
+    let run = project.run();
+    assert_eq!(run.code, 0, "{}", log_paths(&project, &run));
+    assert!(run.stderr.contains("走査を省略しました"), "{}", run.stderr);
+    let output = project.out_dir().join("stealth-16-6-alpha-gzip-2.webp");
+    // The payload is not carried over, so no generated text is written.
+    assert_eq!(user_comment(&output), None);
+}
+
+/// `stealth = false` disables the scan for every input (8-bit included).
+#[test]
+fn stealth_scan_can_be_disabled_in_the_config() {
+    let project = Project::new("stealth-off");
+    project.configure(&[("stealth", "false")]);
+    project.copy_fixture("stealth-8-6-alpha-zlib-4.png");
+    let run = project.run();
+    assert_eq!(run.code, 0, "{}", log_paths(&project, &run));
+    assert!(run.stderr.contains("無効"), "{}", run.stderr);
+    let output = project.out_dir().join("stealth-8-6-alpha-zlib-4.webp");
+    assert_eq!(user_comment(&output), None);
+}
+
+/// Architectural note: the `png` crate verifies chunk CRCs, while Pillow's PNG
+/// reader does not. Measured 2026-11-27: the Python implementation converts
+/// `crc-mismatch.png` (exit 0, 72 bytes output) and the Rust implementation
+/// fails the job (exit 1, `OSError ... CRC error`). This test pins the current
+/// Rust behaviour so the divergence stays visible; whether to match Pillow is
+/// an open decision (doc/img2webp-rust-completion-evidence.md §6).
+#[test]
+fn png_with_a_bad_chunk_crc_fails_the_job() {
+    let project = Project::new("bad-crc");
+    project.copy_fixture("crc-mismatch.png");
+    let run = project.run();
+    assert_eq!(run.code, 1, "{}", log_paths(&project, &run));
+    assert!(run.stderr.contains("CRC"), "{}", run.stderr);
+    assert!(!project.out_dir().join("crc-mismatch.webp").exists());
+}
+
 #[test]
 fn jpeg_orientation_and_cmyk() {
     let project = Project::new("jpeg-convert");
@@ -849,21 +891,30 @@ fn overwrite_disabled_reports_broken_symlink_destination() {
 #[test]
 fn unc_paths_are_supported_for_input_and_output() {
     // Uses the administrative share of the drive that holds the temporary
-    // directory; the test is skipped when the share is not reachable.
+    // directory. When the share is unreachable the test cannot exercise the
+    // UNC path, so it reports the skip loudly instead of passing silently: a
+    // green run then means "either verified or skipped", which is why the
+    // evidence report records the reachability check separately.
     let project = Project::new("unc");
     project.copy_fixture("text.png");
     let root = project.root().to_path_buf();
     let text = root.to_string_lossy().to_string();
     let Some(rest) = text.strip_prefix("C:\\") else {
+        eprintln!("SKIP unc_paths_are_supported_for_input_and_output: temporary directory is not on C:");
         return;
     };
     if !text.starts_with("C:\\") {
+        eprintln!("SKIP unc_paths_are_supported_for_input_and_output: unexpected temporary path shape");
         return;
     }
     let unc_root = format!("\\\\localhost\\C$\\{}", rest);
     if fs::create_dir_all(format!("{unc_root}\\inputs")).is_err() {
-        return; // admin share unavailable
+        eprintln!(
+            "SKIP unc_paths_are_supported_for_input_and_output: administrative share {unc_root} is unreachable"
+        );
+        return;
     }
+    eprintln!("RUN unc_paths_are_supported_for_input_and_output: using {unc_root}");
     let mut config = include_str!("fixtures/config-fixture.ini").to_string();
     config = config.replace(
         "input_dir = inputs",
