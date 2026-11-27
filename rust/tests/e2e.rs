@@ -622,20 +622,19 @@ fn stealth_scan_can_be_disabled_in_the_config() {
     assert_eq!(user_comment(&output), None);
 }
 
-/// Architectural note: the `png` crate verifies chunk CRCs, while Pillow's PNG
-/// reader does not. Measured 2026-11-27: the Python implementation converts
-/// `crc-mismatch.png` (exit 0, 72 bytes output) and the Rust implementation
-/// fails the job (exit 1, `OSError ... CRC error`). This test pins the current
-/// Rust behaviour so the divergence stays visible; whether to match Pillow is
-/// an open decision (doc/img2webp-rust-completion-evidence.md §6).
+/// The `png` crate verifies chunk CRCs, while Pillow's PNG reader does not.
+/// The two implementations must agree, so a bad CRC is repaired and the file is
+/// decoded again with a warning instead of failing the job (decision
+/// 2026-11-27: follow Pillow, keep the damage visible).
 #[test]
-fn png_with_a_bad_chunk_crc_fails_the_job() {
+fn png_with_a_bad_chunk_crc_is_converted_with_a_warning() {
     let project = Project::new("bad-crc");
     project.copy_fixture("crc-mismatch.png");
     let run = project.run();
-    assert_eq!(run.code, 1, "{}", log_paths(&project, &run));
+    assert_eq!(run.code, 0, "{}", log_paths(&project, &run));
     assert!(run.stderr.contains("CRC"), "{}", run.stderr);
-    assert!(!project.out_dir().join("crc-mismatch.webp").exists());
+    assert!(run.stderr.contains("WARN"), "{}", run.stderr);
+    assert!(project.out_dir().join("crc-mismatch.webp").exists());
 }
 
 #[test]

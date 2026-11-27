@@ -106,6 +106,7 @@ Python 版との違いは [`doc/img2webp-rust-implementation.md`](doc/img2webp-r
 - 一辺 16,384px 以上の画像は処理前に失敗する。
 - メモリ予算を超えるジョブは失敗しうる。
 - 標準出力・標準エラーは UTF-8。
+- チャンク CRC が壊れた PNG は、Python 版（Pillow）と同じく CRC を計算し直して変換し、`WARN` を出します。
 
 移行とロールバックの手順は [`doc/img2webp-rust-migration.md`](doc/img2webp-rust-migration.md)、設計と検証の記録は [`doc/img2webp-rust-design-spec.md`](doc/img2webp-rust-design-spec.md)・[`doc/img2webp-rust-phase0.md`](doc/img2webp-rust-phase0.md) を参照してください。
 

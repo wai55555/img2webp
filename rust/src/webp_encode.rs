@@ -30,6 +30,68 @@ fn set_ffi_active(value: bool) {
     FFI_ACTIVE.with(|flag| flag.set(value));
 }
 
+/// Marks the enclosing scope as "inside a libwebp call" and clears the flag on
+/// drop, including while the thread unwinds. Without the guard a panic in the
+/// scope would leave the flag set and a later pure-Rust panic would be
+/// classified as a fatal FFI panic (design spec §3.6).
+struct FfiCall;
+
+impl FfiCall {
+    fn enter() -> Self {
+        set_ffi_active(true);
+        FfiCall
+    }
+}
+
+impl Drop for FfiCall {
+    fn drop(&mut self) {
+        set_ffi_active(false);
+    }
+}
+
+/// Owns the `WebPMemoryWriter` buffer: libwebp allocates it in
+/// `WebPMemoryWriterInit` and only `WebPMemoryWriterClear` releases it.
+struct MemoryWriter {
+    raw: sys::WebPMemoryWriter,
+}
+
+impl MemoryWriter {
+    fn new() -> Self {
+        let mut raw: sys::WebPMemoryWriter = unsafe { std::mem::zeroed() };
+        unsafe { sys::WebPMemoryWriterInit(&mut raw) };
+        MemoryWriter { raw }
+    }
+
+    fn as_mut(&mut self) -> &mut sys::WebPMemoryWriter {
+        &mut self.raw
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        if self.raw.mem.is_null() || self.raw.size == 0 {
+            return Vec::new();
+        }
+        unsafe { std::slice::from_raw_parts(self.raw.mem, self.raw.size) }.to_vec()
+    }
+}
+
+impl Drop for MemoryWriter {
+    fn drop(&mut self) {
+        unsafe { sys::WebPMemoryWriterClear(&mut self.raw) };
+    }
+}
+
+/// Owns a `WebPAnimEncoder` handle so every early return (and any unwind)
+/// releases it exactly once.
+struct AnimEncoderGuard(*mut sys::WebPAnimEncoder);
+
+impl Drop for AnimEncoderGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { sys::WebPAnimEncoderDelete(self.0) };
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct EncodeSettings {
     pub quality: i64,
@@ -159,24 +221,21 @@ pub fn encode_still(pixels: &Pixels, settings: &EncodeSettings) -> Result<Vec<u8
         settings.exact,
     )?;
     let mut picture = Picture::new(pixels)?;
-    let mut writer: sys::WebPMemoryWriter = unsafe { std::mem::zeroed() };
-    unsafe { sys::WebPMemoryWriterInit(&mut writer) };
+    let mut writer = MemoryWriter::new();
     {
         let raw = picture.as_mut();
         raw.writer = Some(sys::WebPMemoryWrite);
-        raw.custom_ptr = (&mut writer) as *mut sys::WebPMemoryWriter as *mut std::ffi::c_void;
+        raw.custom_ptr = writer.as_mut() as *mut sys::WebPMemoryWriter as *mut std::ffi::c_void;
     }
-    set_ffi_active(true);
-    let ok = unsafe { sys::WebPEncode(&config, picture.as_mut()) };
-    set_ffi_active(false);
+    let ok = {
+        let _ffi = FfiCall::enter();
+        unsafe { sys::WebPEncode(&config, picture.as_mut()) }
+    };
     if ok == 0 {
         let code = picture.as_mut().error_code;
-        unsafe { sys::WebPMemoryWriterClear(&mut writer) };
         return Err(format!("WebP エンコードに失敗しました: {code:?}"));
     }
-    let bytes = unsafe { std::slice::from_raw_parts(writer.mem, writer.size) }.to_vec();
-    unsafe { sys::WebPMemoryWriterClear(&mut writer) };
-    Ok(bytes)
+    Ok(writer.bytes())
 }
 
 pub fn encode_animation(
@@ -227,32 +286,26 @@ pub fn encode_animation(
     if encoder.is_null() {
         return Err("WebP アニメーションエンコーダを作成できません".to_string());
     }
+    let encoder = AnimEncoderGuard(encoder);
     let mut timestamp: i64 = 0;
     for (pixels, duration) in frames {
         if pixels.width() != width || pixels.height() != height {
-            unsafe { sys::WebPAnimEncoderDelete(encoder) };
             return Err("フレームの寸法が一致しません".to_string());
         }
-        let mut picture = match Picture::new(pixels) {
-            Ok(picture) => picture,
-            Err(error) => {
-                unsafe { sys::WebPAnimEncoderDelete(encoder) };
-                return Err(error);
+        let mut picture = Picture::new(pixels)?;
+        let added = {
+            let _ffi = FfiCall::enter();
+            unsafe {
+                sys::WebPAnimEncoderAdd(
+                    encoder.0,
+                    picture.as_mut(),
+                    timestamp.min(i32::MAX as i64) as i32,
+                    &config,
+                )
             }
         };
-        set_ffi_active(true);
-        let added = unsafe {
-            sys::WebPAnimEncoderAdd(
-                encoder,
-                picture.as_mut(),
-                timestamp.min(i32::MAX as i64) as i32,
-                &config,
-            )
-        };
-        set_ffi_active(false);
         if added == 0 {
-            let message = encoder_error(encoder);
-            unsafe { sys::WebPAnimEncoderDelete(encoder) };
+            let message = encoder_error(encoder.0);
             return Err(format!(
                 "WebP アニメーションのエンコードに失敗しました: {message}"
             ));
@@ -260,28 +313,30 @@ pub fn encode_animation(
         timestamp = timestamp.saturating_add((*duration).max(0));
     }
     // Flush: a null frame with the total duration (Pillow does the same).
-    let flushed = unsafe {
-        sys::WebPAnimEncoderAdd(
-            encoder,
-            std::ptr::null_mut(),
-            timestamp.min(i32::MAX as i64) as i32,
-            std::ptr::null(),
-        )
+    let flushed = {
+        let _ffi = FfiCall::enter();
+        unsafe {
+            sys::WebPAnimEncoderAdd(
+                encoder.0,
+                std::ptr::null_mut(),
+                timestamp.min(i32::MAX as i64) as i32,
+                std::ptr::null(),
+            )
+        }
     };
     if flushed == 0 {
-        let message = encoder_error(encoder);
-        unsafe { sys::WebPAnimEncoderDelete(encoder) };
+        let message = encoder_error(encoder.0);
         return Err(format!(
             "WebP アニメーションの確定に失敗しました: {message}"
         ));
     }
     let mut data: sys::WebPData = unsafe { std::mem::zeroed() };
-    set_ffi_active(true);
-    let assembled = unsafe { sys::WebPAnimEncoderAssemble(encoder, &mut data) };
-    set_ffi_active(false);
+    let assembled = {
+        let _ffi = FfiCall::enter();
+        unsafe { sys::WebPAnimEncoderAssemble(encoder.0, &mut data) }
+    };
     if assembled == 0 {
-        let message = encoder_error(encoder);
-        unsafe { sys::WebPAnimEncoderDelete(encoder) };
+        let message = encoder_error(encoder.0);
         return Err(format!(
             "WebP アニメーションの出力に失敗しました: {message}"
         ));
@@ -294,7 +349,6 @@ pub fn encode_animation(
     if !data.bytes.is_null() {
         unsafe { sys::WebPFree(data.bytes as *mut std::ffi::c_void) };
     }
-    unsafe { sys::WebPAnimEncoderDelete(encoder) };
     Ok(bytes)
 }
 
@@ -583,6 +637,19 @@ mod tests {
         };
         let data = encode_still(&pixels, &settings).expect("encode after the unwind");
         assert_eq!(&data[..4], b"RIFF");
+    }
+
+    /// The FFI flag is cleared even when the scope unwinds (the guard makes the
+    /// invariant structural, so a future edit cannot leave it set).
+    #[test]
+    fn ffi_guard_clears_the_flag_on_unwind() {
+        let outcome = std::panic::catch_unwind(|| {
+            let _ffi = FfiCall::enter();
+            assert!(ffi_active());
+            panic!("boom inside the FFI scope");
+        });
+        assert!(outcome.is_err());
+        assert!(!ffi_active(), "the guard must reset the flag while unwinding");
     }
 
     /// The FFI flag is thread local by design: a panic in one job must not be

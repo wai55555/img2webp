@@ -14,6 +14,7 @@ comparison is outside the acceptance criteria (design spec §3.1).
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import shutil
@@ -58,6 +59,7 @@ DEFAULT_FIXTURES = [
     "apng-default-only.png",
     "mpo.jpg",
     "precision12.jpg",
+    "crc-mismatch.png",
     "broken.png",
 ]
 
@@ -192,6 +194,24 @@ def patched_config(patches: dict[str, str], for_python: bool = False) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+# Differences that the acceptance criteria allow, with the reason. Anything not
+# listed here fails the run; `--strict` also fails the listed ones.
+EXPECTED_DIFFERENCES = {
+    ("apng-16bit.png", ""): (
+        "16bit APNG is unsupported by design (Rust fails the job, Python converts)"
+    ),
+    ("cmyk-icc.jpg", "jpeg-convert"): (
+        "ICC profile bytes differ in the sRGB creation timestamp (4 bytes); pixels match"
+    ),
+}
+
+
+def tag_of(label: str) -> str:
+    if " [" not in label:
+        return ""
+    return label.rsplit(" [", 1)[1].rstrip("]")
+
+
 def compare_fixture(name: str, root: Path, patches: dict[str, str] = None, tag: str = "") -> dict:
     patches = patches or {}
     label = f"{name}{(' [' + tag + ']') if tag else ''}"
@@ -299,7 +319,15 @@ def main() -> int:
         "exact": ["text.png"],
         "method0": ["text.png"],
     }
-    selected = sys.argv[1:]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="also fail on the differences listed in EXPECTED_DIFFERENCES",
+    )
+    parser.add_argument("fixtures", nargs="*", help="fixture names (default: all)")
+    arguments = parser.parse_args()
+    selected = arguments.fixtures
     if not RUST_EXE.exists():
         print(f"missing release binary: {RUST_EXE}", file=sys.stderr)
         print("build with: cargo build --release --no-default-features", file=sys.stderr)
@@ -326,6 +354,7 @@ def main() -> int:
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
     failures = 0
+    expected_differences = 0
     for report in reports:
         problems = []
         if report["exit"][0] != report["exit"][1]:
@@ -357,8 +386,16 @@ def main() -> int:
                     problems.append(
                         f"{entry['file']}: frame {index} pixel diff count={diff} max={worst}"
                     )
-        status = "OK" if not problems else "DIFF"
-        if problems:
+        expected_reason = EXPECTED_DIFFERENCES.get(
+            (report["fixture"].split(" [")[0], tag_of(report["fixture"]))
+        )
+        if not problems:
+            status = "OK"
+        elif expected_reason and not arguments.strict:
+            status = "EXPECTED"
+            expected_differences += 1
+        else:
+            status = "DIFF"
             failures += 1
         print(f"[{status}] {report['fixture']}")
         print(f"    py: exit={report['exit'][0]} {report['py_stdout']}")
@@ -373,11 +410,15 @@ def main() -> int:
             print(f"    byte-identical outputs: {identical}/{compared}")
         for problem in problems:
             print(f"    ! {problem}")
+        if status == "EXPECTED":
+            print(f"    ~ expected: {expected_reason}")
     for label in skipped:
         print(f"[RUST-ONLY] {label} (Python 版に該当設定が無いため比較対象外)")
+    equivalent = len(reports) - failures - expected_differences
     print(
-        f"\n{len(reports) - failures}/{len(reports)} fixtures equivalent "
-        f"({len(skipped)} rust-only cases excluded)"
+        f"\n{equivalent}/{len(reports)} fixtures equivalent"
+        f" (+{expected_differences} expected differences,"
+        f" {len(skipped)} rust-only cases excluded)"
     )
     return 0 if failures == 0 else 1
 

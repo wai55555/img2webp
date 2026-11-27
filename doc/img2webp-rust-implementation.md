@@ -57,8 +57,8 @@ cargo test --no-default-features                       # リリース相当の�
 
 | 完了条件 | 証跡 |
 | --- | --- |
-| コピーと静止画変換の black-box 相当テスト | `tests/e2e.rs`（36 件、2026-11-27 実測。CRC と Stealth 設定の 3 件を追加） |
-| 再構成した単体テスト | `src/*.rs` の単体テスト（48 件、同じく実測。FFI パニック安全性 2 件・16bit プリフィクス一致 1 件・Stealth 設定 1 件を追加） |
+| コピーと静止画変換の black-box 相当テスト | `tests/e2e.rs`（36 件、2026-11-27 実測。CRC・Stealth 設定・UNC 可視化を含む） |
+| 再構成した単体テスト | `src/*.rs` の単体テスト（49 件、同じく実測。FFI パニック安全性 3 件・16bit プリフィクス一致 1 件・Stealth 設定 1 件を追加） |
 | Python 製 DB の複製でコピー再利用・変換の一度きりの再作成 | `tests/behaviour.rs::python_database_copy_records_are_reused_and_conversions_rebuilt` |
 | 待機制御（先着順・後続停止・リコンサイル） | `tests/behaviour.rs::jobs_wait_for_budget_without_losing_work`、`lost_completion_notification_is_reclaimed_by_reconcile`、`src/budget.rs` の単体テスト |
 | 同梱 config.ini テンプレとコード既定値の一致 | `src/config.rs::bundled_template_matches_code_defaults` |
@@ -182,6 +182,7 @@ cargo test --no-default-features                       # リリース相当の�
 | 11 | 標準出力・標準エラーは UTF-8 | Rust の `println!`/`eprintln!`（`Reporter`） | 全テスト（日本語文言） |
 | 12 | 整数のアンダースコア・Unicode 数字を受理しない | `config::parse_int` | `src/config.rs::validates_ranges_and_types` |
 | 13 | 標準出力・標準エラーへの書き込み失敗はジョブ成否に数えない | `Reporter`（失敗したら以後の表示を打ち切る） | 実装のみ（パイプ切断の自動テストなし） |
+| 16 | チャンク CRC が壊れた PNG を Pillow と同じく変換する（CRC を計算し直し `WARN`） | `convert::repair_png_crcs` | `tests/e2e.rs::png_with_a_bad_chunk_crc_is_converted_with_a_warning`、`compare_with_python.py`（出力バイト一致） |
 | 15 | Stealth 走査の設定（`stealth`／`stealth_max_pixels`）を追加し、上限超過の 16bit PNG は走査を省略して WARN を出す（2026-11-27 の利用者決定。§4.2） | `src/convert.rs::skip_stealth_scan`、`src/config.rs` | `tests/e2e.rs::stealth_scan_is_skipped_above_the_pixel_cap`、`stealth_scan_can_be_disabled_in_the_config` |
 | 14 | ディスパッチャ／FFI パニック時は最終 commit なし | `dispatch::run` の `catch_unwind`、`webp_encode::FFI_ACTIVE` | ディスパッチャ／FFI パニックの注入は未実施（ワーカーパニックは試験済み） |
 
@@ -201,6 +202,8 @@ cargo test --no-default-features                       # リリース相当の�
 12. **UNC 出力の WAL フォールバック**: SMB 上では SQLite の WAL 共有メモリを作れないため、`journal_mode=WAL` の設定後に最初の書き込みが共有メモリ関連の I/O エラーになった場合だけ `journal_mode=DELETE` に切り替え、WARN を出して続行する（ローカルフォルダでは WAL のまま）。`StateDb::wal_enabled()` で検出する。
 13. **テスト用フック**: `dispatch::Options` に `hook`/`interrupt_after`/`second_interrupt_after`/`commit_hook`/`faults`/`budget_override`/`parallel_override`/`cleanup_min_age`/`now`/`stagnation_timeout` を持つ。バイナリは既定値のまま使うため、本番に差し替え経路は無い。
 14. **Stealth 走査の 2 段化と設定項目**: 16bit はシグネチャの 120 ビット分の行だけ復号して判定し、ペイロードが無ければ全展開しない（負ケースのコストを 19〜21% から 5.3%/3.7% へ）。`stealth`／`stealth_max_pixels` を追加し、`pipeline` を 4 に上げた。設定が出力（生成テキスト）に効くため、既存の変換記録は一度だけ作り直しになる。
+16. **PNG の CRC 不一致は Pillow に合わせる**: CRC で失敗したときだけ CRC を計算し直して再復号し、`WARN` を出す（`convert::repair_png_crcs`）。意図的な変更ではなく互換のための追従だが、警告行が増える。
+17. **FFI の資源管理を RAII 化**: `WebPMemoryWriter`・`WebPAnimEncoder`・FFI 中フラグをスコープガードに移し、巻き戻し時も解放・復帰する（`webp_encode::{MemoryWriter, AnimEncoderGuard, FfiCall}`）。挙動は変えない。
 15. **安全係数**: 2.0 で確定（§2 Phase 5 の「安全係数の確定」行。実測との比較で据え置きを決定）。以前ここに「2.0 の暫定のまま（Phase 5 の確定項目は未達）」と書いていたが、設計書 §6 Phase 0 が「安全係数は暫定値の決定をもって Phase 0 の決着範囲とする」と定めており、Phase 5 で実測比較のうえ据え置きを決めたため、確定として扱う。
 
 ### 5.1 エンコーダ設定の掃引（コーパス 1＋7、Rust のみ、2 回の中央値）
@@ -224,7 +227,7 @@ cargo test --no-default-features                       # リリース相当の�
 ## 6. テスト実行結果
 
 ```
-cargo test                        # 48 unit + 14 behaviour + 36 e2e = 98 件、失敗 0
+cargo test                        # 49 unit + 14 behaviour + 36 e2e = 99 件、失敗 0
 cargo test --no-default-features  # 同じ件数（リリース相当の読み替え）
 python3 doc/tools/check_spec_references.py  # 設計書の相互参照はすべて解決
 ```
@@ -239,6 +242,6 @@ python3 doc/tools/check_spec_references.py  # 設計書の相互参照はすべ�
 - コールド I/O 状態での計測（OS のキャッシュ制御ができず未実施）。
 - 安全係数は実測との比較で 2.0 を維持すると決めたが、長尺アニメーションの実コーパスでの再確認は未実施。
 
-Python 版との出力比較（`rust/tests/compare_with_python.py`）は**比較可能な 36 ケース中 34 ケースが完全等価**、差分は 2 ケース。内訳は 16bit APNG（設計どおりの意図的な失敗）と `cmyk-icc.jpg`（ICC の 4 バイト差＝sRGB プロファイル作成日時で、§3.1 の合格基準内）。
+Python 版との出力比較（`rust/tests/compare_with_python.py`）は **37 ケース中 35 が完全等価、2 件が「許容済みの差」**（16bit APNG＝設計どおりの意図的な失敗、`cmyk-icc.jpg`＝ICC の 4 バイト差＝sRGB プロファイル作成日時で §3.1 の合格基準内）。許容差はスクリプトの `EXPECTED_DIFFERENCES` に理由付きで明示し、それ以外の差は失敗、`--strict` で既知の差も失敗扱いにする。したがって通常実行は終了コード 0 で、CI に置ける。
 
-**照合で判明した測定側の欠陥を修正**: 旧スクリプトは、テンプレートに無い設定（`lossless`/`exact`/`method`）のパッチを黙って捨てていたため、lossless／exact／method0 の 6 ケースは実際には既定設定どうしの比較（＝無意味な一致）だった。設定をセクションに挿入するよう修正し、Python 版が表現できない設定（`lossless`/`exact`/`method`/`parallel_jobs`/`stealth`/`stealth_max_pixels`）を使う 6 ケースは `[RUST-ONLY]` として比較対象から外した（これらは `tests/e2e.rs` で個別に検証する）。スクリプトは合格基準を実装していないため、基準内の差でも終了コード 1 を返す。
+**照合で判明した測定側の欠陥を修正**: 旧スクリプトは、テンプレートに無い設定（`lossless`/`exact`/`method`）のパッチを黙って捨てていたため、lossless／exact／method0 の 6 ケースは実際には既定設定どうしの比較（＝無意味な一致）だった。設定をセクションに挿入するよう修正し、Python 版が表現できない設定（`lossless`/`exact`/`method`/`parallel_jobs`/`stealth`/`stealth_max_pixels`）を使う 6 ケースは `[RUST-ONLY]` として比較対象から外した（これらは `tests/e2e.rs` で個別に検証する）。（照合時に発見した測定欠陥の修正内容は下記のとおり。合格基準はスクリプトに実装済み。）

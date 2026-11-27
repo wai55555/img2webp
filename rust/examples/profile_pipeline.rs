@@ -127,7 +127,9 @@ fn run_once(
     }
     let decoded = {
         let t = Instant::now();
-        let decoded = convert::decode_still(source, &probed, &interrupt).ok()?;
+        let mut decode_warnings: Vec<String> = Vec::new();
+        let decoded = convert::decode_still(source, &probed, &interrupt, &mut decode_warnings)
+            .ok()?;
         stages.decode = ms(t);
         decoded
     };

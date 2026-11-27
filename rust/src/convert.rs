@@ -99,6 +99,70 @@ fn sixteen_luma_alpha_to_rgba(image: &image::ImageBuffer<image::LumaA<u16>, Vec<
     Pixels::Rgba(out)
 }
 
+fn png_to_dynamic<R: std::io::BufRead + std::io::Seek>(
+    reader: R,
+    path: &Path,
+) -> Result<image::DynamicImage, JobError> {
+    let decoder = image::codecs::png::PngDecoder::new(reader)
+        .map_err(|err| JobError::from_image(&err, path))?;
+    image::DynamicImage::from_decoder(decoder).map_err(|err| JobError::from_image(&err, path))
+}
+
+/// Rebuilds a PNG with correct chunk CRCs and returns the damaged chunk names.
+///
+/// `png`-based decoding (unlike Pillow) rejects chunks whose CRC does not
+/// match, so this is only used to keep parity with the Python version.
+fn repair_png_crcs(path: &Path) -> Option<(Vec<u8>, Vec<String>)> {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 8 || data[..8] != SIGNATURE {
+        return None;
+    }
+    let mut out = data[..8].to_vec();
+    let mut offset = 8usize;
+    let mut damaged: Vec<String> = Vec::new();
+    let mut saw_end = false;
+    while offset + 12 <= data.len() {
+        let length =
+            u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+                as usize;
+        let type_at = offset + 4;
+        let data_at = offset + 8;
+        let data_end = data_at.checked_add(length)?;
+        let crc_at = data_end;
+        let end = crc_at.checked_add(4)?;
+        if end > data.len() {
+            return None;
+        }
+        let kind = &data[type_at..data_at];
+        let mut crc = flate2::Crc::new();
+        crc.update(&data[type_at..data_end]);
+        let computed = crc.sum();
+        let stored = u32::from_be_bytes([
+            data[crc_at],
+            data[crc_at + 1],
+            data[crc_at + 2],
+            data[crc_at + 3],
+        ]);
+        out.extend_from_slice(&data[offset..data_end]);
+        if stored == computed {
+            out.extend_from_slice(&data[crc_at..end]);
+        } else {
+            damaged.push(String::from_utf8_lossy(kind).to_string());
+            out.extend_from_slice(&computed.to_be_bytes());
+        }
+        offset = end;
+        if kind == b"IEND" {
+            saw_end = true;
+            break;
+        }
+    }
+    if !saw_end || damaged.is_empty() {
+        return None;
+    }
+    Some((out, damaged))
+}
+
 fn luma_alpha_to_rgba(image: &image::ImageBuffer<image::LumaA<u8>, Vec<u8>>) -> Pixels {
     let mut out = image::RgbaImage::new(image.width(), image.height());
     for (x, y, pixel) in image.enumerate_pixels() {
@@ -112,14 +176,29 @@ pub fn decode_still(
     path: &Path,
     probe: &Probe,
     interrupt: &Interrupt,
+    warnings: &mut Vec<String>,
 ) -> Result<Decoded, JobError> {
     match probe.format {
         Format::Png => {
-            let reader = open_reader(path)?;
-            let decoder = image::codecs::png::PngDecoder::new(reader)
-                .map_err(|err| JobError::from_image(&err, path))?;
-            let dynamic = image::DynamicImage::from_decoder(decoder)
-                .map_err(|err| JobError::from_image(&err, path))?;
+            let dynamic = match png_to_dynamic(open_reader(path)?, path) {
+                Ok(dynamic) => dynamic,
+                Err(error) => {
+                    // Pillow does not verify chunk CRCs, so a file with a bad
+                    // CRC still converts there. Recompute the CRCs, decode the
+                    // repaired bytes and say so (intentional compatibility,
+                    // design spec §5).
+                    match repair_png_crcs(path) {
+                        Some((bytes, damaged)) => {
+                            warnings.push(format!(
+                                "PNG のチャンク CRC が不正でした（{}）。Pillow と同じく無視して変換します",
+                                damaged.join(", ")
+                            ));
+                            png_to_dynamic(std::io::Cursor::new(bytes), path)?
+                        }
+                        None => return Err(error),
+                    }
+                }
+            };
             let mode = match probe.color_type {
                 0 => SourceMode::L,
                 2 => SourceMode::Rgb,
@@ -272,19 +351,19 @@ pub fn convert(
         )));
     }
 
-    let decoded = decode_still(source, probe, interrupt)?;
+    let mut warnings: Vec<String> = Vec::new();
+    let decoded = decode_still(source, probe, interrupt, &mut warnings)?;
     let first_pixels = match &decoded {
         Decoded::Pixels(pixels, _) => Some(pixels.clone()),
         Decoded::Cmyk(_) => None,
     };
-    let mut stealth_warnings: Vec<String> = Vec::new();
     let hidden = if !config.stealth {
-        stealth_warnings.push(
+        warnings.push(
             "Stealth PNG Info の読み取りが設定で無効になっているため、隠しテキストは引き継ぎません"
                 .to_string(),
         );
         String::new()
-    } else if skip_stealth_scan(probe, config, &mut stealth_warnings) {
+    } else if skip_stealth_scan(probe, config, &mut warnings) {
         String::new()
     } else {
         stealth::stealth_text(probe, source, first_pixels.as_ref(), interrupt)
@@ -374,7 +453,7 @@ pub fn convert(
             output_icc,
             config,
             destination,
-            &stealth_warnings,
+            &warnings,
         )
     } else if let Some(first) = animation_frames.into_iter().next() {
         let frame = color::apply_orientation(first, prepared.orientation);
@@ -401,7 +480,7 @@ pub fn convert(
             output_icc,
             config,
             destination,
-            &stealth_warnings,
+            &warnings,
         )
     } else {
         let single = match decoded {
@@ -437,7 +516,7 @@ pub fn convert(
             output_icc,
             config,
             destination,
-            &stealth_warnings,
+            &warnings,
         )
     }
 }

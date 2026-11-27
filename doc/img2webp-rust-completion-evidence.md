@@ -620,4 +620,36 @@ $ python3 doc/tools/check_spec_references.py    # all cross references resolve
 | 8-3 | GIF 頻度の標本調査 | 未実施（実入力フォルダの指定が必要） |
 | 8-4 | FFI 周りの RAII ガード | 未実施（タグ済み成果物を変えるため保留。§6.3 のとおり現行は到達不能） |
 | 8-5 | 比較スクリプトの終了コード | 未実施（§11.4） |
+| 8-2〜8-5 | （2026-11-27 に解決。§12 を参照） | — |
 | 8-6 | 配布 exe の再生成 | 記録済み（`--locked` 確認ビルドで 2026-11-27 20:12 に再生成。本番コードの差分なし。今回の Stealth 変更でさらに再ビルドされる） |
+
+---
+
+# 12. 決定依頼 4 件の解決（2026-11-27）
+
+§8／§11.6 に残していた 4 件を、利用者の決定どおりに解決した。
+
+| # | 決定 | 実装 | 証跡 |
+| --- | --- | --- | --- |
+| 8-2 | **PNG の CRC 不一致は Pillow に合わせる**（CRC を計算し直して続行し `WARN`） | `rust/src/convert.rs::repair_png_crcs`＋`decode_still` の再試行。`decode_still` は警告を受け取る形にした | e2e `png_with_a_bad_chunk_crc_is_converted_with_a_warning`（終了コード 0・WARN・出力あり）。`compare_with_python.py` の `crc-mismatch.png` は **[OK]・出力バイト完全一致**（Python 版 exit 0 と一致）。WARN 文言: `PNG のチャンク CRC が不正でした（IDAT）。Pillow と同じく無視して変換します` |
+| 8-3 | **GIF 頻度の標本調査は対象外** | docs のみ（設計書 §4.2 と §7/9） | 根拠: BUG-01 は Phase 0 で「`GifDecoder` が Pillow と画素完全一致（disposal 合成込み）」と決着済みで、頻度は判断の入力にならない。将来必要になった時点で実入力パスを指定して実施する旨を明記 |
+| 8-4 | **FFI 周りを RAII 化** | `rust/src/webp_encode.rs` に `FfiCall`／`MemoryWriter`／`AnimEncoderGuard` を追加し、手動の `set_ffi_active(false)`・`WebPMemoryWriterClear`・`WebPAnimEncoderDelete` を置き換え | 新テスト `ffi_guard_clears_the_flag_on_unwind`（巻き戻し中にフラグが戻る）。既存の `picture_is_freed_when_the_thread_unwinds`・`ffi_flag_is_thread_local` も通過。正常系の挙動は不変（98 → 99 テストのうち 1 件追加、他は同結果） |
+| 8-5 | **比較スクリプトに合格基準を実装** | `rust/tests/compare_with_python.py` に `EXPECTED_DIFFERENCES`（理由付き）と `--strict` を追加 | 通常実行が **終了コード 0**: `35/37 fixtures equivalent (+2 expected differences, 6 rust-only cases excluded)`。既知の差は 16bit APNG（設計どおりの失敗）と `cmyk-icc.jpg`（ICC 4 バイト差）のみで、それ以外の差は従来どおり失敗 |
+
+## 12.1 追加変更の回帰確認
+
+```
+$ cargo test                        # 49 unit + 14 behaviour + 36 e2e = 99 件、失敗 0
+$ cargo test --no-default-features  # 同じ 99 件、失敗 0
+$ python3 doc/tools/check_spec_references.py   # all cross references resolve
+$ .venv/bin/python rust/tests/compare_with_python.py
+  35/37 fixtures equivalent (+2 expected differences, 6 rust-only cases excluded)  exit 0
+```
+
+- Stealth の再計測（回帰確認）: 8bit **0.09%**、16bit 256×256 **5.33%**、16bit 1024×1024 **3.66%**（変換本体比）。§11 の是正結果から変化なし
+- 変更した本番コード: `rust/src/convert.rs`（CRC 再試行と警告の受け渡し）、`rust/src/webp_encode.rs`（RAII）。`pipeline` は 4 のまま（CRC 追従は変換内容を変えないため署名は据え置き）
+
+## 12.2 残項目
+
+- タグ `rust-v1.0.0` は `main` へマージ後に切る（未作成）
+- 配布 exe は今回の変更で再ビルド済み（`cargo build --release --no-default-features --locked`）。マージ後に改めてビルド・スモークテストを行う
