@@ -74,6 +74,39 @@ WebP 変換時は Exif の向きを画素に反映します。CMYK の JPEG に 
 
 日時は、Windows では作成・アクセス・更新日時、それ以外ではアクセス・更新日時を引き継ぎます。`preserve.timestamps = false` にすると出力時の日時になります。ファイルシステムごとの日時精度には差があります。
 
+## Rust 版（img2webp.exe）
+
+同じ処理を Rust で実装した版を `rust/` に置いています。単一 exe で動作し、設定・出力命名・状態 DB・メッセージ形式は Python 版と互換です。主対象は Windows です。
+
+```shell
+cd rust
+cargo build --release --no-default-features --locked
+```
+
+- `--no-default-features` は必須です。既定の feature `dev-db` は開発用の状態 DB 名と出力先（`outputs-dev`）に切り替えるため、付けたままビルドした exe は実 DB を使いません。
+- `--locked` は `Cargo.lock` のとおりにビルドします（リリースでは必須）。
+- `img2webp.bat` は exe があればそれを起動し、無ければ Python 版を起動します。
+
+設定は現行の `config.ini` がそのまま動きます。次の任意項目を追加できます（省略時は現行と同じ挙動）。
+
+| 項目 | 説明 |
+| --- | --- |
+| `webp.lossless` | `true` で lossless 圧縮（既定 `false`） |
+| `webp.method` | libwebp の method、0〜6（省略時は静止画 4／アニメーション 0） |
+| `webp.exact` | 透明部分の RGB を保持（既定 `false`、静止画のみ） |
+| `output.parallel_jobs` | 同時に処理するジョブ数（省略時は CPU コア数、超過はコア数にクランプ） |
+
+Python 版との違いは [`doc/img2webp-rust-implementation.md`](doc/img2webp-rust-implementation.md) §4〜5 にまとめています。主なものは次のとおりです。
+
+- 出力ファイルの権限が通常の作成権限（umask 準拠）になる。
+- 変換対象は移行時に一度だけ作り直される（コピーは状態 DB の記録を再利用）。
+- 16bit APNG は未対応（ジョブ単位の失敗）。
+- 一辺 16,384px 以上の画像は処理前に失敗する。
+- メモリ予算を超えるジョブは失敗しうる。
+- 標準出力・標準エラーは UTF-8。
+
+移行とロールバックの手順は [`doc/img2webp-rust-migration.md`](doc/img2webp-rust-migration.md)、設計と検証の記録は [`doc/img2webp-rust-design-spec.md`](doc/img2webp-rust-design-spec.md)・[`doc/img2webp-rust-phase0.md`](doc/img2webp-rust-phase0.md) を参照してください。
+
 ## ライセンス
 
 [MIT License](LICENSE.md)。

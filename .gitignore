@@ -4,12 +4,18 @@
 /png2webp/
 *.sqlite3
 *.sqlite3-*
+!rust/tests/fixtures/python-compat/python-state.sqlite3
 *.db
 *.db-*
 
 # Local utility (kept on disk, not published)
 /flip_vertical.bat
 /flip_vertical.py
+
+# Rust build artifacts and measurement scratch
+/rust/target/
+/.bench/
+/.compare-tmp/
 
 # Python environments and generated files
 /.venv/

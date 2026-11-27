@@ -1,0 +1,14 @@
+{
+  "inputs/sample.webp": {
+    "mtime_ns": 1700000000000000000
+  },
+  "inputs/image.png": {
+    "mtime_ns": 1700000000000000000
+  },
+  "outputs/sample.webp": {
+    "mtime_ns": 1700000000000000000
+  },
+  "outputs/image.webp": {
+    "mtime_ns": 1700000000000000000
+  }
+}
