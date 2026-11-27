@@ -342,6 +342,30 @@ def write_misc() -> None:
     Image.new("RGB", (3, 3), "blue").save(
         HERE / "conflict.png", pnginfo=info, exif=exif
     )
+    write_crc_mismatch()
+
+
+def write_crc_mismatch() -> None:
+    """A PNG whose IDAT CRC is wrong (design spec §3.4: PNG の CRC 不一致).
+
+    The pixel data itself is valid, so only a CRC check can reject the file.
+    Pillow (libpng) raises `Broken PNG file`; the Rust side must fail the job
+    instead of converting.
+    """
+    width, height = 2, 2
+    rows = b"".join(b"\x00" + b"\xff\x00\x00" * width for _ in range(height))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    data = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+    # Flip the last byte of the IDAT CRC (the 4 bytes before IEND's length).
+    crc_offset = data.rindex(b"IEND") - 4 - 1
+    damaged = bytearray(data)
+    damaged[crc_offset] ^= 0xff
+    (HERE / "crc-mismatch.png").write_bytes(bytes(damaged))
 
 
 def main() -> None:

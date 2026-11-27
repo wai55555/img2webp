@@ -39,12 +39,14 @@
 | D-MEM | `sysinfo::System::available_memory()`（起動時に 1 回だけ取得） | 予算は起動時固定。テストでは `Options::budget_override` で内部指定する（本番バイナリに差し替え経路は無い）。 |
 | D-LOCK | `build.rs` が **`Cargo.lock` を直接パース**して対象クレートの版を埋め込む（`cargo metadata` は使わない） | `cargo metadata --offline` は、lock に含まれる他プラットフォーム向けパッケージ（例: `objc2-core-foundation`）がローカルキャッシュに無いと失敗する。lock 直接パースはオフラインで決定的。対象クレートは image/png/gif/zune-jpeg/zune-core/image-webp/jpeg-decoder/libwebp-sys/rusqlite/lcms2/lcms2-sys/flate2/miniz_oxide。libwebp 本体の版は実行時に `WebPGetEncoderVersion()` で取得（動的リンクではないため実行時版＝ビルド時版）。`Cargo.lock` はリポジトリにコミットし、リリースビルドは `--locked` を必須とする。 |
 
+上記の D-ENC の検証項目のうち、**`WebPConfig` の全フィールド対応表**は照合時に欠落が判明したため [`img2webp-rust-webpconfig-mapping.md`](img2webp-rust-webpconfig-mapping.md) に作成した（libwebp 1.6.0 の 29 フィールドについて、libwebp 既定値・Pillow 静止画・Pillow アニメ・img2webp 静止画・img2webp アニメを対比）。**FFI パニック時の Drop 挙動**は `src/webp_encode.rs` の単体テスト 2 件（`picture_is_freed_when_the_thread_unwinds`、`ffi_flag_is_thread_local`）で固定した。
+
 ## 3. §3.1〜§3.8 から委譲された検証項目の結論
 
 ### 3.1 画素等価性の合格基準（確定）
 
 - 同一 libwebp 版（1.6.0）・同一設定では、**静止画・アニメーションの双方で画素の完全一致を要求する**。
-- 実測（`rust/tests/compare_with_python.py`、41 ケース）: 画素差 0。内訳は PNG（8bit RGBA/RGB/パレット、16bit RGB/RGBA/LA/グレー、Stealth 8/16bit、gzip/zlib/info、フィルタ 0〜4）、GIF（全面・部分フレーム・disposal 1/2/3・背景色あり）、APNG（default_image あり/なし）、JPEG（RGB/グレー/CMYK/CMYK+ICC/Orientation）、コピー（JPEG/WebP/WebM）。lossless／lossy、method 0/4、exact、metadata 有無の各変種を含む。
+- 実測（`rust/tests/compare_with_python.py`、**42 ケース**）: 画素差 0（合格基準内）。内訳は PNG（8bit RGBA/RGB/パレット、16bit RGB/RGBA/LA/グレー、Stealth 8/16bit、gzip/zlib/info、フィルタ 0〜4）、GIF（全面・部分フレーム・disposal 1/2/3・背景色あり）、APNG（default_image あり/なし）、JPEG（RGB/グレー/CMYK/CMYK+ICC/Orientation）、コピー（JPEG/WebP/WebM）。lossless／lossy、method 0/4、exact、metadata 有無の各変種を含む。
 - CMS 経路（CMYK/L/LA＋ICC）だけは ICC プロファイルのバイト列が一致しない（sRGB プロファイルの作成日時 4 バイト）。**合格基準は「画素完全一致＋出力 ICC が sRGB として解釈できること」**とし、ICC バイトの一致は求めない。
 - ファイルサイズは合格基準に含めない（実測差は全体で +0.11%）。
 - 16bit APNG は §3.4 の決定どおり未対応（ジョブ単位の失敗）で、比較対象から除外する。
@@ -82,13 +84,14 @@ Rust 側はこの 2 方式を実装し、比較で画素差 0 を確認した（
 - **Pillow の ARGB インポート**: Pillow の `_webp.c` は `WebPPicture.use_argb = 1` でピクチャを作る（RGB→YUV 変換をライブラリに任せない）。Rust 側も同じ経路に合わせたところ、アニメーションの ANMF がバイト一致した（RGB 直接インポートでは後続フレームの lossy 出力がわずかにずれた）。
 - **GIF の背景色（bgcolor）**: Pillow は `info["background"]`（グローバルカラーテーブルのインデックス）を RGBA に変換するが、本ツールのパイプラインではフレームが RGB/RGBA に変換済みでパレットが失われているため、実効値は `(index, index, index, 255)`。Rust 側も同じ値を使う（実測で ANIM の bgcolor が一致）。
 - **PNG メタデータの取得範囲**: 実測（Pillow 13）では、テキストチャンクは IDAT の前後どちらでも `info` に入る（`tail-text.png` で確認）。eXIf / iCCP も同様に読めた。Rust 側はチャンク走査で全文を対象にするため、Pillow より取得範囲が広い（後方配置も取得）。これは「保持が増える」方向の差で、比較でも一致した。
-- **PNG の CRC 不一致**: `image`/`png` クレートはチャンク CRC を検証してデコードエラーにする。Pillow（libpng）も同様に失敗する。Stealth 用の生デコード（`png_raw.rs`）は現行どおり CRC を検証しない。差は「壊れた PNG はどちらも失敗する」で一致。
+- **PNG の CRC 不一致**: `image`/`png` クレートはチャンク CRC を検証してデコードエラーにする。**Pillow は CRC を検証しないため、差がある**（当初「Pillow も同様に失敗する」と記録していたが、2026-11-27 の照合で誤りと判明）。実測: `rust/tests/fixtures/crc-mismatch.png`（画素データは有効で IDAT の CRC だけを壊したもの）に対し、Python 版は変換成功（`変換 1`、終了コード 0、72 バイト出力）、Rust 版は `OSError ... CRC error` でジョブ失敗（終了コード 1）。Stealth 用の生デコード（`png_raw.rs`）は現行どおり CRC を検証しない。この差は互換性の後退であり、Pillow に合わせるか意図的な変更として記録するかは決定依頼（`img2webp-rust-completion-evidence.md` §6）。e2e テスト `png_with_a_bad_chunk_crc_fails_the_job` が現状の Rust 側挙動を固定している。
 - **MPO / SOF 精度**: MPO は APP2 の `MPF\0` で検出し、変換対象なら「拡張子は JPEG ですが、実際の形式は MPO です」でジョブ失敗（コピー設定ならコピー）。SOF 精度が 8 でない JPEG は第 1 段で「JPEG のサンプル精度 12 は未対応です」でジョブ失敗。Pillow はどちらもデコードに失敗する（`OSError`）。
 - **ctime の取得可否**: Windows は `Metadata::created()`、POSIX は `ctime`/`ctime_nsec` で取得可能。取得できない環境では再利用を無効化し、起動時に WARN を出す。
 - **ICC の色空間不一致**: `lcms2::Profile::color_space()` の署名（`CMYK`/`RGB`/`GRAY`）で判定。Pillow の `profile.xcolor_space.strip()` と同じ判定になる。エラー文言も現行どおり 2 種を使い分ける。
 - **`casefold` 差分（SPEC-02）**: Python の `str.casefold` と Rust の `to_lowercase` の差は、`ß→ss`、`ς→σ`、`ﬁ` などの合字、`ŉ`、`ǰ`、`ΐ`、`ΰ`、`ẖ/ẗ/ẘ/ẙ/ẚ`、`և`、アルメニア合字、`U+0345`。`src/paths.rs::casefold` でこれらを個別に写像する。未対応は Unicode の `F`（full folding）系の一部（ギリシャ文字の `ᾼ` 等の大文字＋ypogegrammeni 展開）で、ファイル名として現れる頻度は無視できる。差が残る文字をファイル名に使った場合のみ衝突判定が変わりうる。
 - **UNC パス**: Windows の verbatim プレフィックス（`\\?\`、`\\?\UNC\`）を剥がして `C:\...` / `\\server\share\...` に戻す実装を入れた。実測は管理共有 `\\localhost\C$` を使い、入力・出力の両方を UNC にした設定で確認した（`tests/e2e.rs::unc_paths_are_supported_for_input_and_output`、開発ビルドの派生先 `outputs-dev` も UNC 上で作成される）。**判明した差異**: SQLite の WAL は SMB 上で共有メモリファイル（`-shm`）を作れず `disk I/O error` になる。Python 版（Windows の Python 3.10 同梱 SQLite）は同じ設定で成功したため、Rust 版は WAL 作成に失敗したときだけロールバックジャーナル（`journal_mode=DELETE`）へフォールバックし、WARN を出して続行する（ローカルフォルダでは従来どおり WAL）。このフォールバックは意図的な追加（§5 の意図的な変更に対する追加事項）として記録する。
 - **ERROR 行の写像表**: `ConversionError`（形式不一致・表示時間・ループ・フレーム無し・処理中の変更・寸法上限・16bit APNG）、`UnidentifiedImageError`（形式不明）、`OSError`（デコード失敗・I/O）、`PermissionError`/`FileNotFoundError`（I/O 種別）、`DecompressionBombError`（画素数上限）、`MemoryError`（予算超過）、`PanicError`（ワーカーの純 Rust パニック。現行に対応する型が無いための専用対応）。ライブラリ由来の文面は `image` のエラー文字列をそのまま含める（Pillow の文面とは異なる）。
+- **JPEG／GIF コメントの取得経路（2026-11-27 追記）**: JPEG は APP セグメントの COM（`0xFE`）を `probe.rs` のセグメント走査で読み、GIF はコメント拡張ブロック（`0xFE`）をブロック走査で読む。どちらも最初の 1 件を `Probe::comment` に保持し、生成テキストの差し込みに使う（`metadata::source_text`）。実測: `probe.rs::gif_frames_loop_and_comment` が `anim.gif` の `gif prompt` を検証し、`compare_with_python.py` の `anim.gif`・`once.gif` で出力の UserComment が Python 版と一致する。JPEG 側はフィクスチャに COM を持つものが無いため、経路の確認はコード読解と `probe.rs` のセグメント走査に留まる（**限界**）。
 
 ## 4. テストの white-box / black-box 振り分け
 
@@ -125,7 +128,8 @@ black-box の期待値の読み替え規則: 開発ビルドは出力先が `out
 | 全体（111 件） | 1.051 s | 0.351 s | 2.99× | 135.3 MiB | 106.4 MiB |
 
 - 出力合計バイト: Python 217,954 / Rust 218,194（+0.11%）。画素は全件一致。
-- 判定基準（§4.2 の原案）に対する評価: 静止画バッチの目標「現行比 2 倍以上」を満たす（2.99×）。「単一ファイルで 5% 超の劣化カテゴリを作らない」も満たす（最遅カテゴリでも 1.97×）。Stealth 負ケースの追加コストはカテゴリ 2 と 1 の差で評価する（Rust: 0.085 s / 20 件 = 4.3 ms/件、カテゴリ 1 は 1.9 ms/件）。§4.2 の判定基準はこの原案どおりで**確定**（緩和なし）。
+- 判定基準（§4.2 の原案）に対する評価: 静止画バッチの目標「現行比 2 倍以上」を満たす（2.99×）。「単一ファイルで 5% 超の劣化カテゴリを作らない」も満たす（最遅カテゴリでも 1.97×）。§4.2 の判定基準はこの原案どおりで**確定**（緩和なし）。
+- **Stealth 負ケースの追加コスト（2026-11-27 再計測）**: 本節の当初の評価（カテゴリ 2 とカテゴリ 1 の 1 件あたり時間の差）は別々のコーパスを比べており、負ケースの追加コストの判定には使えない（カテゴリ 2 は 4.23 ms/件、カテゴリ 1 は 1.89 ms/件で、差を取ると +124% になる）。同一ファイルで Stealth 走査 on/off を切り替える統制比較を `rust/examples/profile_pipeline.rs` で追加し、次の結果を得た: 8bit 負ケース（AI PNG 40 件）0.09%（基準内）、16bit 負ケース（256×256 10 件）**19.0%**、1024×1024 3 件 **20.6%**。16bit 負ケースは §4.2 の「変換本体の 10% 以内」を**満たさない**。是正するか基準の適用範囲を見直すかは決定依頼（`img2webp-rust-completion-evidence.md` §6）。
 - 計測スクリプトと生データ: `rust/tests/benchmark.py`、`.bench/results.json`（リポジトリには含めない。再実行で再生成できる）。
 - 限界: 3 回の中央値であり、5% 差の判定までは分解していない（§4.2 の要求どおり、Phase 5 の本計測では必要なら回数を増やす）。I/O キャッシュのコールド制御は未実施。
 

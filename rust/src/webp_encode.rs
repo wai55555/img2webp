@@ -558,4 +558,45 @@ mod tests {
             .count();
         assert_eq!(animation_frames, 2);
     }
+
+    /// Panic-safety of the FFI scope (design spec §6 Phase 0, D-ENC item
+    /// "FFI パニック時の Drop 挙動"): a `WebPPicture` that is alive when the
+    /// thread unwinds must be released exactly once, and the heap must stay
+    /// usable afterwards. The window between `set_ffi_active(true)` and
+    /// `set_ffi_active(false)` contains nothing but the libwebp call, so a
+    /// Rust panic cannot start there (libwebp never calls back into Rust).
+    #[test]
+    fn picture_is_freed_when_the_thread_unwinds() {
+        let pixels = Pixels::Rgb(image::RgbImage::from_pixel(8, 8, image::Rgb([10, 20, 30])));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _picture = Picture::new(&pixels).expect("picture");
+            panic!("boom while a WebPPicture is alive");
+        }));
+        assert!(outcome.is_err());
+        assert!(!ffi_active(), "the FFI flag must not be left set");
+        let settings = EncodeSettings {
+            quality: 90,
+            lossless: false,
+            method_still: 4,
+            method_animation: 0,
+            exact: false,
+        };
+        let data = encode_still(&pixels, &settings).expect("encode after the unwind");
+        assert_eq!(&data[..4], b"RIFF");
+    }
+
+    /// The FFI flag is thread local by design: a panic in one job must not be
+    /// classified by another job's libwebp call (Phase 5 finding).
+    #[test]
+    fn ffi_flag_is_thread_local() {
+        assert!(!ffi_active());
+        set_ffi_active(true);
+        let seen_by_another_thread = std::thread::spawn(ffi_active).join().unwrap();
+        assert!(
+            !seen_by_another_thread,
+            "another thread observed this thread's FFI call"
+        );
+        set_ffi_active(false);
+        assert!(!ffi_active());
+    }
 }

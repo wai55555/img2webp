@@ -57,8 +57,8 @@ cargo test --no-default-features                       # リリース相当の�
 
 | 完了条件 | 証跡 |
 | --- | --- |
-| コピーと静止画変換の black-box 相当テスト | `tests/e2e.rs`（32 件） |
-| 再構成した単体テスト | `src/*.rs` の単体テスト（41 件） |
+| コピーと静止画変換の black-box 相当テスト | `tests/e2e.rs`（34 件、2026-11-27 照合時の実測。CRC フィクスチャの 1 件を追加） |
+| 再構成した単体テスト | `src/*.rs` の単体テスト（46 件、同じく照合時の実測。FFI パニック安全性の 2 件を追加） |
 | Python 製 DB の複製でコピー再利用・変換の一度きりの再作成 | `tests/behaviour.rs::python_database_copy_records_are_reused_and_conversions_rebuilt` |
 | 待機制御（先着順・後続停止・リコンサイル） | `tests/behaviour.rs::jobs_wait_for_budget_without_losing_work`、`lost_completion_notification_is_reclaimed_by_reconcile`、`src/budget.rs` の単体テスト |
 | 同梱 config.ini テンプレとコード既定値の一致 | `src/config.rs::bundled_template_matches_code_defaults` |
@@ -94,7 +94,7 @@ cargo test --no-default-features                       # リリース相当の�
 | Stealth 全バリエーション | `src/stealth.rs::all_variants_are_extracted`（8/16bit × RGB/RGBA/LA × info/gzip/zlib × フィルタ 0〜4） |
 | 不正ペイロード・制限・切り詰め | `invalid_payloads_return_empty`、`tests/e2e.rs::stealth_payloads_become_user_comments` |
 | APNG の Stealth がフレーム巡回前の先頭フレームから読まれる | `src/convert.rs` が `decode_still`（開いた直後のフレーム）から抽出し、生成テキストへ結合。`tests/e2e.rs::stealth_payloads_become_user_comments` が変換を通した結合を確認 |
-| 負ケースのコスト計測 | `img2webp-rust-phase0.md` §5（カテゴリ 2 と 1 の比較）。判定基準（変換本体の 10% 以内）は満たす |
+| 負ケースのコスト計測 | **未達（2026-11-27 再計測）**。`rust/examples/profile_pipeline.rs` で同一ファイルの Stealth 走査 on/off を比較した結果、8bit 負ケース（AI PNG 40 件）は変換本体の 0.09%（基準内）、16bit 負ケース（256×256 10 件）は 19.0%、1024×1024 3 件では 20.6% となり、設計書 §4.2 の「変換本体の 10% 以内」を満たさない。旧記述の「カテゴリ 2 と 1 の差」は別コーパス間の比較で、判定に使えない（`img2webp-rust-completion-evidence.md` §6）。是正するか基準の適用範囲を見直すかは**決定依頼** |
 
 ### Phase 4（アニメーション）
 
@@ -136,6 +136,8 @@ cargo test --no-default-features                       # リリース相当の�
 | dev-db 無し・`--locked` でビルド | `cargo build --release --no-default-features --locked` で成功。配布 exe 個体の確認: 試験フォルダで実行し、`.img2webp.sqlite3` が作られ、出力先が `outputs`、開発ビルドの起動行が出ないことを確認 |
 | 単一 exe | `.cargo/config.toml` で CRT を静的リンク。`objdump -p` の依存は Windows のシステム DLL のみ（VCRUNTIME140.dll への依存なし）。lcms2/libwebp/SQLite はすべて静的リンク |
 | BUG-04 の解消を Windows で確認 | 生成した `outputs\text.webp` の ACL が、同じフォルダに通常作成したファイルの ACL（ディレクトリ継承）と一致することを `icacls` で確認 |
+| dev-db 非混入の個体確認（照合時に再取得） | 2026-11-27 20:12 に `rust/target/release/img2webp.exe`（4,290,048 バイト）を空の一時フォルダで実行し、`.img2webp.sqlite3` を `outputs` に生成、`outputs-dev`・`.img2webp-dev-output`・開発ビルドの起動行がいずれも出ないことを確認（終了コード 0、0.24 s）。ビルド側の裏付けは `target/release/.fingerprint/img2webp-*/bin-img2webp.json` の `features: []` |
+| `--locked` の確認（照合時） | `cargo build --release --no-default-features --locked` が成功（`Finished release profile ... in 3.08s`）。`rust/Cargo.lock` は `c964601` から未変更（`git diff HEAD -- rust/Cargo.lock` が空） |
 
 ## 3. 変換シグネチャのゴールデン文字列
 
@@ -196,7 +198,7 @@ cargo test --no-default-features                       # リリース相当の�
 11. **FFI フラグのスレッドローカル化**: libwebp 呼び出し中フラグをプロセス全体（原子変数）ではなくスレッドローカルにした。並列実行時、別ジョブの FFI 呼び出し中に起きた純 Rust パニックを「FFI パニック（プロセス終了）」と誤判定しないため（テストで発見）。
 12. **UNC 出力の WAL フォールバック**: SMB 上では SQLite の WAL 共有メモリを作れないため、`journal_mode=WAL` の設定後に最初の書き込みが共有メモリ関連の I/O エラーになった場合だけ `journal_mode=DELETE` に切り替え、WARN を出して続行する（ローカルフォルダでは WAL のまま）。`StateDb::wal_enabled()` で検出する。
 13. **テスト用フック**: `dispatch::Options` に `hook`/`interrupt_after`/`second_interrupt_after`/`commit_hook`/`faults`/`budget_override`/`parallel_override`/`cleanup_min_age`/`now`/`stagnation_timeout` を持つ。バイナリは既定値のまま使うため、本番に差し替え経路は無い。
-12. **安全係数**: 2.0 の暫定のまま（Phase 5 の確定項目は未達）。
+14. **安全係数**: 2.0 で確定（§2 Phase 5 の「安全係数の確定」行。実測との比較で据え置きを決定）。以前ここに「2.0 の暫定のまま（Phase 5 の確定項目は未達）」と書いていたが、設計書 §6 Phase 0 が「安全係数は暫定値の決定をもって Phase 0 の決着範囲とする」と定めており、Phase 5 で実測比較のうえ据え置きを決めたため、確定として扱う。
 
 ### 5.1 エンコーダ設定の掃引（コーパス 1＋7、Rust のみ、2 回の中央値）
 
@@ -219,10 +221,12 @@ cargo test --no-default-features                       # リリース相当の�
 ## 6. テスト実行結果
 
 ```
-cargo test                        # 44 unit + 14 behaviour + 33 e2e
+cargo test                        # 46 unit + 14 behaviour + 34 e2e = 94 件、失敗 0
 cargo test --no-default-features  # 同じ件数（リリース相当の読み替え）
 python3 doc/tools/check_spec_references.py  # 設計書の相互参照はすべて解決
 ```
+
+件数は 2026-11-27 の照合時に実行して確認した（`img2webp-rust-completion-evidence.md` §3.1）。照合で追加したテスト（`webp_encode::tests::picture_is_freed_when_the_thread_unwinds`、`ffi_flag_is_thread_local`、`e2e::png_with_a_bad_chunk_crc_fails_the_job`）を含む。
 
 ## 7. 残っている未達・未検証項目
 
@@ -232,4 +236,4 @@ python3 doc/tools/check_spec_references.py  # 設計書の相互参照はすべ�
 - コールド I/O 状態での計測（OS のキャッシュ制御ができず未実施）。
 - 安全係数は実測との比較で 2.0 を維持すると決めたが、長尺アニメーションの実コーパスでの再確認は未実施。
 
-Python 版との出力比較（`rust/tests/compare_with_python.py`、41 ケース）は 40 ケースが完全等価、1 ケース（16bit APNG）は設計どおりの意図的な失敗。
+Python 版との出力比較（`rust/tests/compare_with_python.py`、**42 ケース**）は 40 ケースが完全等価、差分は 2 ケース。内訳は 16bit APNG（設計どおりの意図的な失敗）と `cmyk-icc.jpg`（ICC の 4 バイト差＝sRGB プロファイル作成日時で、§3.1 の合格基準内）。スクリプトは合格基準を実装していないため、基準内の差でも終了コード 1 を返す。
