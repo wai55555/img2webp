@@ -1,0 +1,4 @@
+# Ship a single self-contained executable: link the C runtime statically so the
+# distribution does not need VCRUNTIME140.dll (design spec §3.1 policy 3).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
